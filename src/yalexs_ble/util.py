@@ -104,3 +104,49 @@ def unique_id_from_local_name_address(local_name: str, address: str) -> str:
 def local_name_is_unique(local_name: str | None) -> bool:
     """Check if the local name is unique."""
     return bool(local_name and len(local_name) == UNIQUE_LOCAL_NAME_LEN)
+
+
+def decode_battery_from_manufacturer_data(mfr_data: bytes) -> tuple[int | None, str]:
+    """
+    Attempt to decode battery information from Yale manufacturer data (ID 0x01D1 = 465).
+
+    This is a best-effort decoder for locks like MD-04I that may advertise
+    battery information in manufacturer-specific data. The exact format is not
+    fully documented, so this function is structured to be easily updated as
+    we learn more about the format.
+
+    Args:
+        mfr_data: Raw manufacturer data payload from advertisements
+
+    Returns:
+        Tuple of (battery_percentage, raw_hex_string)
+        - battery_percentage: Estimated percentage (0-100) or None if unknown
+        - raw_hex_string: Hex representation for diagnostics
+
+    Example observed data:
+        0x01000002FF783A111A0B25DB4F3E1AD56DCAD17
+    """
+    raw_hex = mfr_data.hex()
+
+    if len(mfr_data) < 2:
+        return None, raw_hex
+
+    # For now, we don't have enough information to reliably decode battery
+    # from manufacturer data. We'll log the raw data for future analysis.
+    # Potential battery indicators to investigate:
+    # - Byte 0-1: Header/flags
+    # - Byte 2-3: Possible status fields
+    # - Look for small values (0-100 or 0-5) that might indicate battery
+
+    # Heuristic: look for bytes that could be battery percentage (0-100)
+    # or level enum (0-5) in the first few bytes
+    for i in range(min(len(mfr_data), 10)):
+        value = mfr_data[i]
+        # If we find a value between 0-100 that's not 0xFF, it might be battery
+        if 0 < value <= 100 and value != 0xFF:
+            # This is speculative - we'd need real-world data to confirm
+            # For now, just return None to indicate we don't know
+            pass
+
+    # Return None for battery percentage until we can decode the format
+    return None, raw_hex

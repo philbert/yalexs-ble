@@ -39,6 +39,12 @@ class StatusType(IntEnum):
     DOOR_ONLY = 0x2E
     DOOR_AND_LOCK = 0x2F
     BATTERY = 0x0F
+    # Extended status types for battery probing on MD-04I and similar locks
+    EXTENDED_27 = 0x27
+    EXTENDED_29 = 0x29
+    EXTENDED_2D = 0x2D
+    EXTENDED_30 = 0x30
+    EXTENDED_31 = 0x31
 
 
 class SettingType(IntEnum):
@@ -90,10 +96,23 @@ class LockActivityType(Enum):
     NONE = 0x80
 
 
+class BatteryLevel(Enum):
+    """Battery level for locks that don't report percentage."""
+
+    CRITICAL = "critical"
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+
+
 @dataclass
 class BatteryState:
     voltage: float
     percentage: int
+    # For locks that report battery level as enum instead of percentage
+    level: BatteryLevel | None = None
+    # Source of battery data for diagnostics
+    source: str | None = None
 
 
 @dataclass
@@ -181,6 +200,26 @@ class LockInfo:
 @dataclass
 class ConnectionInfo:
     rssi: int
+
+
+@dataclass
+class BatteryProbeState:
+    """Tracks battery probe state per device to avoid repeated timeouts."""
+
+    # Last time a probe was attempted (monotonic time)
+    last_probe_time: float = 0.0
+    # Status types that have been tried and timed out
+    unsupported_types: set[int] = None
+    # Last successful battery value from probes
+    last_battery: BatteryState | None = None
+    # Last successful probe type
+    last_successful_type: int | None = None
+    # Raw manufacturer data for diagnostics
+    last_mfr_data: bytes | None = None
+
+    def __post_init__(self) -> None:
+        if self.unsupported_types is None:
+            self.unsupported_types = set()
 
 
 class YaleXSBLEDiscovery(TypedDict):

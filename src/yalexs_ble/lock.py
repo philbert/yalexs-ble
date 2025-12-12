@@ -29,6 +29,7 @@ from .const import (
     VALUE_TO_LOCK_STATUS,
     AutoLockMode,
     AutoLockState,
+    BatteryLevel,
     BatteryState,
     Commands,
     DoorActivity,
@@ -464,6 +465,180 @@ class Lock:
         )
         _LOGGER.debug("%s: Finished executing battery", self.name)
         return self._parse_battery_state(response)
+
+    def _try_parse_extended_battery(
+        self, response: bytes, status_type: int
+    ) -> BatteryState | None:
+        """
+        Attempt to parse battery information from extended status responses.
+
+        This is a heuristic decoder that looks for plausible battery values
+        in extended status responses for locks like MD-04I that don't support
+        the standard battery status request.
+
+        Returns None if no plausible battery value is found.
+        """
+        _LOGGER.debug(
+            "%s: Attempting to parse extended battery from response: %s (status_type: 0x%02x)",
+            self.name,
+            response.hex(),
+            status_type,
+        )
+
+        # Response structure: bb 02 XX XX TT 00 00 00 [DATA...]
+        # where TT is the status_type at offset 0x04
+        if len(response) < 0x10:
+            _LOGGER.debug(
+                "%s: Response too short for extended battery data: %d bytes",
+                self.name,
+                len(response),
+            )
+            return None
+
+        # Try to find battery data in the response
+        # We'll look at bytes from 0x08 to 0x0F (8 bytes of potential data)
+        # Check for enum first (0-5) since it's more specific, then percentage (6-100)
+        for offset in range(0x08, min(len(response), 0x10)):
+            value = response[offset]
+
+            # Check for possible enum level (0-5) first - more specific
+            if 0 <= value <= 5:
+                # Map enum to battery level and percentage
+                level_map = {
+                    0: (BatteryLevel.CRITICAL, 5),
+                    1: (BatteryLevel.LOW, 25),
+                    2: (BatteryLevel.MEDIUM, 50),
+                    3: (BatteryLevel.HIGH, 75),
+                    4: (BatteryLevel.HIGH, 90),
+                    5: (BatteryLevel.HIGH, 100),
+                }
+                if value in level_map:
+                    level, pct = level_map[value]
+                    _LOGGER.debug(
+                        "%s: Found plausible level enum at offset 0x%02x: %d -> %s (%d%%)",
+                        self.name,
+                        offset,
+                        value,
+                        level.value,
+                        pct,
+                    )
+                    return BatteryState(
+                        voltage=0.0,
+                        percentage=pct,
+                        level=level,
+                        source=f"extended_status_0x{status_type:02x}_offset_0x{offset:02x}_enum",
+                    )
+
+            # Check for possible percentage (6-100)
+            elif 6 <= value <= 100:
+                _LOGGER.debug(
+                    "%s: Found plausible percentage at offset 0x%02x: %d",
+                    self.name,
+                    offset,
+                    value,
+                )
+                # Use 0 voltage to indicate this is from extended status
+                return BatteryState(
+                    voltage=0.0,
+                    percentage=value,
+                    level=None,
+                    source=f"extended_status_0x{status_type:02x}_offset_0x{offset:02x}",
+                )
+
+        _LOGGER.debug("%s: No plausible battery value found in response", self.name)
+        return None
+
+    @raise_if_not_connected
+    async def battery_probe_extended(
+        self, status_types: list[int] | None = None
+    ) -> BatteryState | None:
+        """
+        Probe for battery using extended GETSTATUS types.
+
+        This is designed for locks like MD-04I that don't support the standard
+        battery request (StatusType.BATTERY = 0x0F) but may include battery
+        data in other status responses.
+
+        Args:
+            status_types: List of status types to try. Defaults to a safe set.
+
+        Returns:
+            BatteryState if successful, None if all probes fail or timeout.
+        """
+        if status_types is None:
+            # Safe list of status types to try, in order of likelihood
+            # Start with DOOR_AND_LOCK (0x2F) since it's known to work on many locks
+            # Then try nearby types that might be extended versions
+            status_types = [
+                StatusType.DOOR_AND_LOCK.value,  # 0x2F
+                StatusType.EXTENDED_2D.value,  # 0x2D
+                StatusType.EXTENDED_30.value,  # 0x30
+                StatusType.EXTENDED_31.value,  # 0x31
+                StatusType.EXTENDED_27.value,  # 0x27
+                StatusType.EXTENDED_29.value,  # 0x29
+            ]
+
+        _LOGGER.debug(
+            "%s: Starting extended battery probe with types: %s",
+            self.name,
+            [f"0x{t:02x}" for t in status_types],
+        )
+
+        for status_type in status_types:
+            try:
+                _LOGGER.debug(
+                    "%s: Probing with status_type 0x%02x", self.name, status_type
+                )
+                response = await self._execute_command(
+                    Commands.GETSTATUS,
+                    status_type,
+                    f"battery_probe_0x{status_type:02x}",
+                )
+                _LOGGER.debug(
+                    "%s: Got response for status_type 0x%02x: %s",
+                    self.name,
+                    status_type,
+                    response.hex(),
+                )
+
+                # Try to parse battery from this response
+                if battery := self._try_parse_extended_battery(response, status_type):
+                    _LOGGER.info(
+                        "%s: Successfully extracted battery from status_type 0x%02x: %s",
+                        self.name,
+                        status_type,
+                        battery,
+                    )
+                    return battery
+            except (TimeoutError, asyncio.TimeoutError) as err:
+                _LOGGER.debug(
+                    "%s: Timeout probing status_type 0x%02x: %s",
+                    self.name,
+                    status_type,
+                    err,
+                )
+                # Stop on first timeout to avoid excessive delays
+                _LOGGER.info(
+                    "%s: Stopping battery probe after timeout on 0x%02x",
+                    self.name,
+                    status_type,
+                )
+                return None
+            except Exception as err:
+                _LOGGER.debug(
+                    "%s: Error probing status_type 0x%02x: %s",
+                    self.name,
+                    status_type,
+                    err,
+                    exc_info=True,
+                )
+                # Continue to next type on other errors
+                continue
+
+        _LOGGER.info(
+            "%s: Extended battery probe exhausted all types without success", self.name
+        )
+        return None
 
     @raise_if_not_connected
     async def auto_lock_status(self) -> AutoLockState:

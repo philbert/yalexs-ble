@@ -28,6 +28,7 @@ from .const import (
     AuthState,
     AutoLockMode,
     AutoLockState,
+    BatteryProbeState,
     BatteryState,
     ConnectionInfo,
     DoorStatus,
@@ -45,7 +46,12 @@ from .session import (
     ResponseError,
     YaleXSBLEError,
 )
-from .util import asyncio_timeout, is_disconnected_error, local_name_is_unique
+from .util import (
+    asyncio_timeout,
+    decode_battery_from_manufacturer_data,
+    is_disconnected_error,
+    local_name_is_unique,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -112,6 +118,10 @@ NO_BATTERY_SUPPORT_MODELS = {
 }
 
 AUTO_LOCK_DEFAULT_DURATION = 90
+
+# Minimum time (seconds) between battery probe attempts to avoid repeated timeouts
+# Default: 12 hours (43200 seconds)
+BATTERY_PROBE_COOLDOWN = 43200
 
 
 def operation_lock(func: WrapFuncType) -> WrapFuncType:
@@ -303,6 +313,7 @@ class PushLock:
         self._last_lock_operation_complete_time = NEVER_TIME
         self._last_operation_complete_time = NEVER_TIME
         self._always_connected = always_connected
+        self._battery_probe_state = BatteryProbeState()
 
     @property
     def local_name(self) -> str | None:
@@ -811,6 +822,85 @@ class PushLock:
         await self._update()
         _LOGGER.debug("%s: Finished validate", self.name)
 
+    def _should_probe_battery(self) -> bool:
+        """
+        Determine if we should attempt battery probing for this lock.
+
+        Returns True if:
+        - Lock model is in NO_BATTERY_SUPPORT_MODELS (needs alternative battery method)
+        - We haven't probed recently (respects cooldown)
+        - We haven't seen battery this session
+        """
+        if not self._lock_info:
+            return False
+
+        # Only probe for models that don't support standard battery request
+        if self._lock_info.model not in NO_BATTERY_SUPPORT_MODELS:
+            return False
+
+        # Don't probe if we've seen battery this session (from probes or ads)
+        if BatteryState in self._seen_this_session:
+            return False
+
+        # Check cooldown
+        time_since_last_probe = (
+            time.monotonic() - self._battery_probe_state.last_probe_time
+        )
+        if time_since_last_probe < BATTERY_PROBE_COOLDOWN:
+            _LOGGER.debug(
+                "%s: Skipping battery probe (cooldown: %.1f/%.1f seconds)",
+                self.name,
+                time_since_last_probe,
+                BATTERY_PROBE_COOLDOWN,
+            )
+            return False
+
+        return True
+
+    async def _try_battery_probe(self, lock: Lock) -> BatteryState | None:
+        """
+        Attempt to probe battery for locks that don't support standard battery request.
+
+        This method tries extended GETSTATUS commands and returns the first successful
+        battery reading. It stops on first timeout to avoid delays.
+
+        Returns BatteryState if successful, None otherwise.
+        """
+        _LOGGER.debug("%s: Attempting battery probe for model %s", self.name, self._lock_info.model)
+
+        # Update probe time to enforce cooldown even if probe fails
+        self._battery_probe_state.last_probe_time = time.monotonic()
+
+        try:
+            battery = await lock.battery_probe_extended()
+            if battery:
+                _LOGGER.info(
+                    "%s: Battery probe succeeded: %s (source: %s)",
+                    self.name,
+                    battery,
+                    battery.source,
+                )
+                self._battery_probe_state.last_battery = battery
+                return battery
+            else:
+                _LOGGER.debug("%s: Battery probe returned no data", self.name)
+                return None
+        except (TimeoutError, asyncio.TimeoutError) as err:
+            _LOGGER.info(
+                "%s: Battery probe timed out: %s (will retry after cooldown)",
+                self.name,
+                err,
+            )
+            return None
+        except Exception as err:
+            _LOGGER.warning(
+                "%s: Battery probe failed with error: %s",
+                self.name,
+                err,
+                exc_info=True,
+            )
+            return None
+
     @operation_lock
     @retry_bluetooth_connection_error
     async def _update(self) -> LockState:
@@ -836,12 +926,27 @@ class PushLock:
             needs_battery_workaround,
         )
         if not needs_battery_workaround and BatteryState not in self._seen_this_session:
+            # Standard battery request for supported models
             made_request = True
             battery_state = await lock.battery()
             _AUTH_FAILURE_HISTORY.auth_success(self.address)
             state = replace(
                 state, battery=battery_state, auth=AuthState(successful=True)
             )
+        elif needs_battery_workaround and self._should_probe_battery():
+            # Alternative battery probing for unsupported models (MD-04I, etc.)
+            _LOGGER.debug(
+                "%s: Model %s needs battery probe, attempting extended status probe",
+                self.name,
+                self._lock_info.model,
+            )
+            if battery_state := await self._try_battery_probe(lock):
+                _AUTH_FAILURE_HISTORY.auth_success(self.address)
+                state = replace(
+                    state, battery=battery_state, auth=AuthState(successful=True)
+                )
+                # Note: we don't set made_request=True because probe has its own timeout handling
+                # and we don't want to affect the normal update flow timing
 
         if (
             DoorStatus not in self._seen_this_session
@@ -1000,6 +1105,25 @@ class PushLock:
                 ):
                     next_update = ADV_UPDATE_COALESCE_SECONDS
             self._last_adv_value = current_value
+
+        # Log Yale manufacturer data for battery analysis (especially for MD-04I)
+        if YALE_MFR_ID in mfr_data and len(mfr_data[YALE_MFR_ID]) > 1:
+            # This is extended manufacturer data, potentially containing battery info
+            yale_data = mfr_data[YALE_MFR_ID]
+            if yale_data != self._battery_probe_state.last_mfr_data:
+                self._battery_probe_state.last_mfr_data = yale_data
+                battery_pct, raw_hex = decode_battery_from_manufacturer_data(yale_data)
+                _LOGGER.debug(
+                    "%s: Yale manufacturer data (model: %s): %s (battery: %s)",
+                    self.name,
+                    self._lock_info.model if self._lock_info else "unknown",
+                    raw_hex,
+                    f"{battery_pct}%" if battery_pct is not None else "unknown",
+                )
+                # If we successfully decoded battery from advertisement, update state
+                # This is not currently implemented but the structure is in place
+                # for future updates once we understand the manufacturer data format
+
         if adv_debug_enabled:
             scheduled_update = None
             if self._cancel_deferred_update:

@@ -5,7 +5,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from bleak_retry_connector import BLEDevice
 
-from yalexs_ble.const import LockOperationRemoteType, LockOperationSource
+from yalexs_ble.const import (
+    BatteryLevel,
+    BatteryState,
+    LockOperationRemoteType,
+    LockOperationSource,
+    StatusType,
+)
 from yalexs_ble.lock import Lock
 
 
@@ -91,3 +97,137 @@ def test_parse_operation_source():
     source, remote_type = lock._parse_operation_source(0x00, 0x00)
     assert source is LockOperationSource.REMOTE
     assert remote_type is LockOperationRemoteType.UNKNOWN
+
+
+def test_try_parse_extended_battery_percentage():
+    """Test parsing battery from extended status response with percentage value."""
+    lock = Lock(
+        lambda: BLEDevice("aa:bb:cc:dd:ee:ff", "lock"),
+        "0800200c9a66",
+        1,
+        "mylock",
+        lambda _: None,
+    )
+
+    # Simulated extended status response with battery percentage at offset 0x08
+    # bb 02 XX XX 2F 00 00 00 [4B] ... (75%)
+    response = bytes.fromhex("bb02001a2f0000004b000000000000000200")
+    battery = lock._try_parse_extended_battery(response, StatusType.DOOR_AND_LOCK.value)
+
+    assert battery is not None
+    assert battery.percentage == 75
+    assert battery.voltage == 0.0  # Extended status uses 0.0 for voltage
+    assert battery.level is None
+    assert "extended_status_0x2f" in battery.source
+
+
+def test_try_parse_extended_battery_enum():
+    """Test parsing battery from extended status response with enum level value."""
+    lock = Lock(
+        lambda: BLEDevice("aa:bb:cc:dd:ee:ff", "lock"),
+        "0800200c9a66",
+        1,
+        "mylock",
+        lambda _: None,
+    )
+
+    # Simulated extended status response with battery enum at offset 0x08
+    # bb 02 XX XX 2F 00 00 00 [03] ... (level 3 = HIGH, 75%)
+    response = bytes.fromhex("bb02001a2f00000003000000000000000200")
+    battery = lock._try_parse_extended_battery(response, StatusType.DOOR_AND_LOCK.value)
+
+    assert battery is not None
+    assert battery.level == BatteryLevel.HIGH
+    assert battery.percentage == 75
+    assert battery.voltage == 0.0
+    assert "enum" in battery.source
+
+
+def test_try_parse_extended_battery_no_data():
+    """Test parsing battery from short response returns None."""
+    lock = Lock(
+        lambda: BLEDevice("aa:bb:cc:dd:ee:ff", "lock"),
+        "0800200c9a66",
+        1,
+        "mylock",
+        lambda _: None,
+    )
+
+    # Short response (less than 0x10 bytes)
+    response = bytes.fromhex("bb02001a2f")
+    battery = lock._try_parse_extended_battery(response, StatusType.DOOR_AND_LOCK.value)
+
+    assert battery is None
+
+
+@pytest.mark.asyncio
+async def test_battery_probe_extended_stops_on_timeout():
+    """Test that battery probe stops after first timeout."""
+    lock = Lock(
+        lambda: BLEDevice("aa:bb:cc:dd:ee:ff", "lock"),
+        "0800200c9a66",
+        1,
+        "mylock",
+        lambda _: None,
+    )
+    # Properly set up connected state
+    mock_client = MagicMock()
+    mock_client.is_connected = True
+    lock.client = mock_client
+    lock.session = MagicMock()
+    lock.secure_session = MagicMock()
+    lock._disconnected = False
+
+    # Mock _execute_command to timeout on first call
+    execute_count = 0
+
+    async def mock_execute(*args, **kwargs):
+        nonlocal execute_count
+        execute_count += 1
+        raise asyncio.TimeoutError("Probe timeout")
+
+    with patch.object(lock, "_execute_command", side_effect=mock_execute):
+        battery = await lock.battery_probe_extended()
+
+    # Should have stopped after first timeout
+    assert battery is None
+    assert execute_count == 1
+
+
+@pytest.mark.asyncio
+async def test_battery_probe_extended_returns_first_success():
+    """Test that battery probe returns first successful result."""
+    lock = Lock(
+        lambda: BLEDevice("aa:bb:cc:dd:ee:ff", "lock"),
+        "0800200c9a66",
+        1,
+        "mylock",
+        lambda _: None,
+    )
+    # Properly set up connected state
+    mock_client = MagicMock()
+    mock_client.is_connected = True
+    lock.client = mock_client
+    lock.session = MagicMock()
+    lock.secure_session = MagicMock()
+    lock._disconnected = False
+
+    # First probe fails, second succeeds
+    call_count = 0
+
+    async def mock_execute(opcode, status_type, command_name):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            # First call: return response with no plausible battery data (all invalid bytes)
+            return bytes.fromhex("bb02001a2f000000ffffffffffffffff0200")
+        else:
+            # Second call: return response with battery percentage (0x4B = 75 at offset 0x08)
+            return bytes.fromhex("bb02001a2d0000004b000000000000000200")
+
+    with patch.object(lock, "_execute_command", side_effect=mock_execute):
+        battery = await lock.battery_probe_extended()
+
+    assert battery is not None
+    assert battery.percentage == 75
+    assert call_count == 2  # Should have tried 2 probes
