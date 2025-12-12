@@ -918,7 +918,10 @@ class PushLock:
             _LOGGER.debug("Obtained lock info: %s", self._lock_info)
         # Asking for battery first seems to be reduce the chance of the lock
         # getting into a bad state.
-        state = self._get_current_state()
+
+        # Track only the changes we explicitly make in this update cycle
+        # to avoid overwriting notify-driven state updates
+        update_changes: dict[str, Any] = {}
         made_request = False
 
         needs_battery_workaround = self._lock_info.model in NO_BATTERY_SUPPORT_MODELS
@@ -932,9 +935,8 @@ class PushLock:
             made_request = True
             battery_state = await lock.battery()
             _AUTH_FAILURE_HISTORY.auth_success(self.address)
-            state = replace(
-                state, battery=battery_state, auth=AuthState(successful=True)
-            )
+            update_changes["battery"] = battery_state
+            update_changes["auth"] = AuthState(successful=True)
         elif needs_battery_workaround and self._should_probe_battery():
             # Alternative battery probing for unsupported models (MD-04I, etc.)
             _LOGGER.debug(
@@ -944,9 +946,8 @@ class PushLock:
             )
             if battery_state := await self._try_battery_probe(lock):
                 _AUTH_FAILURE_HISTORY.auth_success(self.address)
-                state = replace(
-                    state, battery=battery_state, auth=AuthState(successful=True)
-                )
+                update_changes["battery"] = battery_state
+                update_changes["auth"] = AuthState(successful=True)
                 # Note: we don't set made_request=True because probe has its own timeout handling
                 # and we don't want to affect the normal update flow timing
 
@@ -958,18 +959,18 @@ class PushLock:
             made_request = True
             door_status = await lock.door_status()
             _AUTH_FAILURE_HISTORY.auth_success(self.address)
-            state = replace(state, door=door_status, auth=AuthState(successful=True))
+            update_changes["door"] = door_status
+            update_changes["auth"] = AuthState(successful=True)
 
         if AutoLockState not in self._seen_this_session:
             made_request = True
             auto_lock_state = await lock.auto_lock_status()
             _AUTH_FAILURE_HISTORY.auth_success(self.address)
-            state = replace(
-                state,
-                auto_lock=auto_lock_state,
-                auto_lock_prev=state.auto_lock,
-                auth=AuthState(successful=True),
-            )
+            # For auto_lock_prev, we need the current state at time of update
+            current_auto_lock = self._get_current_state().auto_lock
+            update_changes["auto_lock"] = auto_lock_state
+            update_changes["auto_lock_prev"] = current_auto_lock
+            update_changes["auth"] = AuthState(successful=True)
 
         # Only ask for the lock status if we haven't seen
         # it this session since notify callbacks will happen
@@ -984,27 +985,32 @@ class PushLock:
             made_request = True
             lock_status = await lock.lock_status()
             _AUTH_FAILURE_HISTORY.auth_success(self.address)
-            state = replace(state, lock=lock_status, auth=AuthState(successful=True))
+            update_changes["lock"] = lock_status
+            update_changes["auth"] = AuthState(successful=True)
 
         _LOGGER.debug("%s: Finished update", self.name)
-        self._callback_state(state)
+
+        # Merge our updates with the LATEST state (may have been updated by notify callbacks)
+        # This ensures we don't overwrite fresh notify data with stale snapshots
+        final_state = replace(self._get_current_state(), **update_changes)
+        self._callback_state(final_state)
 
         # Only validate voltage if it's provided (not None)
         # Voltage is None for enum-derived battery from extended status
-        if state.battery and state.battery.voltage is not None and state.battery.voltage <= 3.0:
+        if final_state.battery and final_state.battery.voltage is not None and final_state.battery.voltage <= 3.0:
             _LOGGER.debug(
                 "%s: Battery voltage is impossible: %s",
                 self.name,
-                state.battery.voltage,
+                final_state.battery.voltage,
             )
             # If the battery voltage is impossible, reconnect.
             await self._execute_forced_disconnect("impossible battery voltage")
 
-        if state.lock in (LockStatus.UNKNOWN_01, LockStatus.UNKNOWN_06):
-            _LOGGER.debug("%s: Lock is in an unknown state: %s", self.name, state.lock)
+        if final_state.lock in (LockStatus.UNKNOWN_01, LockStatus.UNKNOWN_06):
+            _LOGGER.debug("%s: Lock is in an unknown state: %s", self.name, final_state.lock)
             # If the lock is in a bad state, reconnect.
             await self._execute_forced_disconnect(
-                f"lock is in unknown state: {state.lock}"
+                f"lock is in unknown state: {final_state.lock}"
             )
 
         if not has_lock_info:
@@ -1020,7 +1026,7 @@ class PushLock:
         if made_request:
             self._last_operation_complete_time = time.monotonic()
             self._reschedule_next_keep_alive()
-        return state
+        return final_state
 
     def _callback_state(self, lock_state: LockState) -> None:
         """Call the callbacks."""
