@@ -107,7 +107,7 @@ class BatteryLevel(Enum):
 
 @dataclass
 class BatteryState:
-    voltage: float
+    voltage: float | None  # None when battery is derived from enum/extended status
     percentage: int
     # For locks that report battery level as enum instead of percentage
     level: BatteryLevel | None = None

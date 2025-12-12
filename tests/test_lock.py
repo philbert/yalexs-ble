@@ -116,7 +116,7 @@ def test_try_parse_extended_battery_percentage():
 
     assert battery is not None
     assert battery.percentage == 75
-    assert battery.voltage == 0.0  # Extended status uses 0.0 for voltage
+    assert battery.voltage is None  # Extended status has no voltage data
     assert battery.level is None
     assert "extended_status_0x2f" in battery.source
 
@@ -139,7 +139,7 @@ def test_try_parse_extended_battery_enum():
     assert battery is not None
     assert battery.level == BatteryLevel.HIGH
     assert battery.percentage == 75
-    assert battery.voltage == 0.0
+    assert battery.voltage is None  # Extended status has no voltage data
     assert "enum" in battery.source
 
 
@@ -231,3 +231,76 @@ async def test_battery_probe_extended_returns_first_success():
     assert battery is not None
     assert battery.percentage == 75
     assert call_count == 2  # Should have tried 2 probes
+
+
+def test_enum_battery_has_no_voltage():
+    """Test that enum-derived battery has voltage=None, not 0.0."""
+    lock = Lock(
+        lambda: BLEDevice("aa:bb:cc:dd:ee:ff", "lock"),
+        "0800200c9a66",
+        1,
+        "mylock",
+        lambda _: None,
+    )
+
+    # Battery from enum should have voltage=None
+    response = bytes.fromhex("bb02001a2f00000003000000000000000200")
+    battery = lock._try_parse_extended_battery(response, StatusType.DOOR_AND_LOCK.value)
+
+    assert battery is not None
+    assert battery.voltage is None  # Not 0.0!
+    assert battery.level == BatteryLevel.HIGH
+
+
+def test_percentage_battery_has_no_voltage():
+    """Test that percentage-derived battery from extended status has voltage=None."""
+    lock = Lock(
+        lambda: BLEDevice("aa:bb:cc:dd:ee:ff", "lock"),
+        "0800200c9a66",
+        1,
+        "mylock",
+        lambda _: None,
+    )
+
+    # Battery from percentage should also have voltage=None
+    response = bytes.fromhex("bb02001a2f0000004b000000000000000200")
+    battery = lock._try_parse_extended_battery(response, StatusType.DOOR_AND_LOCK.value)
+
+    assert battery is not None
+    assert battery.voltage is None  # Not 0.0!
+    assert battery.percentage == 75
+
+
+def test_battery_from_enum_levels():
+    """Test battery percentage mapping from enum levels."""
+    lock = Lock(
+        lambda: BLEDevice("aa:bb:cc:dd:ee:ff", "lock"),
+        "0800200c9a66",
+        1,
+        "mylock",
+        lambda _: None,
+    )
+
+    # Test all enum levels
+    test_cases = [
+        (0, BatteryLevel.CRITICAL, 5),
+        (1, BatteryLevel.LOW, 25),
+        (2, BatteryLevel.MEDIUM, 50),
+        (3, BatteryLevel.HIGH, 75),
+        (4, BatteryLevel.HIGH, 90),
+        (5, BatteryLevel.HIGH, 100),
+    ]
+
+    for enum_value, expected_level, expected_pct in test_cases:
+        response = bytes.fromhex(f"bb02001a2f00000000000000000000000200")
+        # Set the enum value at offset 0x08
+        response_list = list(response)
+        response_list[0x08] = enum_value
+        response = bytes(response_list)
+
+        battery = lock._try_parse_extended_battery(response, StatusType.DOOR_AND_LOCK.value)
+
+        assert battery is not None, f"Failed to parse enum value {enum_value}"
+        assert battery.level == expected_level, f"Enum {enum_value}: expected {expected_level}, got {battery.level}"
+        assert battery.percentage == expected_pct, f"Enum {enum_value}: expected {expected_pct}%, got {battery.percentage}%"
+        assert battery.voltage is None

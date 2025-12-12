@@ -523,7 +523,7 @@ class Lock:
                         pct,
                     )
                     return BatteryState(
-                        voltage=0.0,
+                        voltage=None,  # No voltage data from extended status
                         percentage=pct,
                         level=level,
                         source=f"extended_status_0x{status_type:02x}_offset_0x{offset:02x}_enum",
@@ -537,9 +537,9 @@ class Lock:
                     offset,
                     value,
                 )
-                # Use 0 voltage to indicate this is from extended status
+                # No voltage data from extended status
                 return BatteryState(
-                    voltage=0.0,
+                    voltage=None,
                     percentage=value,
                     level=None,
                     source=f"extended_status_0x{status_type:02x}_offset_0x{offset:02x}",

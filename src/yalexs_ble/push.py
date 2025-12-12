@@ -780,7 +780,9 @@ class PushLock:
                 if lock_state.door != state:
                     changes["door"] = state
             elif isinstance(state, BatteryState):
-                if state.voltage <= 3.0:
+                # Only validate voltage if it's provided (not None)
+                # Voltage is None for enum-derived battery from extended status
+                if state.voltage is not None and state.voltage <= 3.0:
                     _LOGGER.debug(
                         "%s: Battery voltage is impossible: %s",
                         self.name,
@@ -987,7 +989,9 @@ class PushLock:
         _LOGGER.debug("%s: Finished update", self.name)
         self._callback_state(state)
 
-        if state.battery and state.battery.voltage <= 3.0:
+        # Only validate voltage if it's provided (not None)
+        # Voltage is None for enum-derived battery from extended status
+        if state.battery and state.battery.voltage is not None and state.battery.voltage <= 3.0:
             _LOGGER.debug(
                 "%s: Battery voltage is impossible: %s",
                 self.name,
