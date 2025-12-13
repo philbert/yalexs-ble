@@ -235,3 +235,67 @@ async def test_update_continues_after_battery_timeout():
         # Battery should be None since it timed out
         assert final_state.battery is None or final_state.battery == push_lock._lock_state.battery if push_lock._lock_state else True
 
+@pytest.mark.asyncio
+async def test_update_preserves_notify_state_from_cache():
+    """
+    Test that _update() does not overwrite lock/door state with UNKNOWN
+    when notify callbacks have updated the cached state.
+
+    Regression test for race condition where:
+    1. Update starts with UNKNOWN state
+    2. Notify callback updates cached state to LOCKED/CLOSED during update
+    3. Update skips polling lock_status (already seen this session)
+    4. Final state should preserve LOCKED/CLOSED from cache, not revert to UNKNOWN
+    """
+    push_lock = PushLock(
+        address="aa:bb:cc:dd:ee:ff",
+        key="0800200c9a66",
+        key_index=1,
+        always_connected=False,
+    )
+    push_lock._name = "Test Lock"
+
+    # Simulate cached state being updated by notify callback to LOCKED/CLOSED
+    push_lock._lock_state = LockState(
+        lock=LockStatus.LOCKED,
+        door=DoorStatus.CLOSED,
+        battery=None,
+        auth=None,
+        auto_lock=None,
+        auto_lock_prev=None,
+    )
+
+    # Mock lock that doesn't return lock/door (simulating skipped polling)
+    mock_lock = MagicMock()
+    mock_lock.lock_info = AsyncMock(return_value=MagicMock(model="ASL-03", door_sense=True))
+
+    push_lock._lock_info = MagicMock(model="ASL-03", door_sense=True)
+    push_lock._running = True
+
+    # Mark lock/door/battery/autolock as already seen to simulate skipped polling
+    push_lock._seen_this_session.add(LockStatus)
+    push_lock._seen_this_session.add(DoorStatus)
+    push_lock._seen_this_session.add(BatteryState)
+    push_lock._seen_this_session.add(AutoLockState)
+
+    # Mock advertisement_data for connection_info
+    push_lock._advertisement_data = AdvertisementData(
+        local_name="Test Lock",
+        service_data={},
+        service_uuids=[],
+        rssi=-50,
+        manufacturer_data={},
+        platform_data=(),
+        tx_power=0,
+    )
+
+    with patch.object(push_lock, "_ensure_connected", return_value=mock_lock):
+        final_state = await push_lock._update()
+
+        # The critical assertion: lock/door must be preserved from cache
+        assert final_state.lock == LockStatus.LOCKED, (
+            f"Lock status should be LOCKED from cache, got {final_state.lock}"
+        )
+        assert final_state.door == DoorStatus.CLOSED, (
+            f"Door status should be CLOSED from cache, got {final_state.door}"
+        )
