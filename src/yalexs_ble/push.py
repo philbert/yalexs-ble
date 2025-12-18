@@ -309,6 +309,30 @@ class PushLock:
         self._last_operation_complete_time = NEVER_TIME
         self._always_connected = always_connected
         self._next_battery_attempt_time = NEVER_TIME  # Cooldown after battery timeout
+
+        # Initialize protocol capture if not provided
+        if protocol_capture is None:
+            try:
+                _LOGGER.info(
+                    "Initializing auto protocol capture for PushLock: %s (%s)",
+                    local_name,
+                    address,
+                )
+                from .protocol_capture import ProtocolCaptureOnceManager
+                protocol_capture = ProtocolCaptureOnceManager(
+                    enabled=True,
+                    capture_path=None,  # Auto-detect writable path
+                    redact=True,
+                    window_duration=15.0,
+                )
+            except Exception as e:
+                import traceback
+                _LOGGER.error(
+                    "Failed to initialize protocol capture:\n%s",
+                    traceback.format_exc(),
+                )
+                protocol_capture = None
+
         self._protocol_capture = protocol_capture
 
     @property

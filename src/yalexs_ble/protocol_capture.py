@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
 import time
+import traceback
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -15,6 +17,44 @@ _LOGGER = logging.getLogger(__name__)
 
 # Redaction configuration
 REDACT_PRESERVE_BYTES = 12  # Increase to 16 or 20 to capture more fields
+
+
+def _get_writable_capture_path() -> Path:
+    """Determine a writable path for protocol captures.
+
+    Tries paths in order:
+    1. /config/yale_captures (Home Assistant OS)
+    2. /tmp/yale_captures (fallback)
+    3. ~/yale_captures (last resort)
+
+    Returns:
+        Path object for first writable directory
+    """
+    candidates = [
+        Path("/config/yale_captures"),
+        Path("/tmp/yale_captures"),
+        Path.home() / "yale_captures",
+    ]
+
+    for path in candidates:
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+            # Test write access
+            test_file = path / ".write_test"
+            test_file.touch()
+            test_file.unlink()
+            _LOGGER.info("Protocol capture path selected: %s", path)
+            return path
+        except (PermissionError, OSError) as e:
+            _LOGGER.debug("Path %s not writable: %s", path, e)
+            continue
+
+    # Fallback to /tmp if nothing else worked
+    fallback = Path("/tmp/yale_captures")
+    _LOGGER.warning(
+        "No writable capture path found, using fallback: %s", fallback
+    )
+    return fallback
 
 
 def redact_bytes(data: bytes, redact: bool) -> str:
@@ -73,7 +113,7 @@ class ProtocolCaptureOnceManager:
     def __init__(
         self,
         enabled: bool,
-        capture_path: str,
+        capture_path: str | Path | None = None,
         redact: bool = True,
         window_duration: float = 15.0,
     ) -> None:
@@ -81,14 +121,19 @@ class ProtocolCaptureOnceManager:
 
         Args:
             enabled: If False, all capture operations are no-ops
-            capture_path: Directory path for capture files
+            capture_path: Directory path for capture files (auto-detected if None)
             redact: If True, redact sensitive data in output
             window_duration: How long to capture per lock (seconds)
         """
         self._enabled = enabled
-        self._capture_path = Path(capture_path)
         self._redact = redact
         self._window_duration = window_duration
+
+        # Auto-detect writable path if not provided
+        if capture_path is None:
+            self._capture_path = _get_writable_capture_path()
+        else:
+            self._capture_path = Path(capture_path)
 
         self._global_enabled = enabled
         self._capture_windows: dict[str, CaptureWindow] = {}
@@ -97,6 +142,8 @@ class ProtocolCaptureOnceManager:
         self._capture_started = False
         self._capture_finished = False
         self._write_lock = threading.Lock()
+        self._first_tx_logged = False
+        self._first_rx_logged = False
 
         if self._enabled:
             self._init_capture_file()
@@ -111,10 +158,13 @@ class ProtocolCaptureOnceManager:
             return
 
         try:
+            # Ensure directory exists
             self._capture_path.mkdir(parents=True, exist_ok=True)
+
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             file_path = self._capture_path / f"protocol_capture_{timestamp}.jsonl"
 
+            # Open file for writing
             self._file_handle = open(file_path, "a", encoding="utf-8")
 
             # Write header event
@@ -126,6 +176,7 @@ class ProtocolCaptureOnceManager:
                 "ts": datetime.now().isoformat(),
                 "python_version": sys.version.split()[0],
                 "platform": platform.platform(),
+                "capture_path": str(self._capture_path),
             }
 
             # Try to get HA version if available
@@ -145,9 +196,17 @@ class ProtocolCaptureOnceManager:
             self._write_event(header)
             self._capture_started = True
 
-            _LOGGER.info("Protocol capture initialized: %s", file_path)
-        except Exception as e:
-            _LOGGER.error("Failed to initialize protocol capture: %s", e)
+            _LOGGER.info(
+                "Protocol capture initialized successfully: %s (redact=%s, window=%.1fs)",
+                file_path,
+                self._redact,
+                self._window_duration,
+            )
+        except Exception:
+            _LOGGER.error(
+                "Failed to initialize protocol capture:\n%s",
+                traceback.format_exc(),
+            )
             self._enabled = False
             self._global_enabled = False
 
@@ -160,8 +219,11 @@ class ProtocolCaptureOnceManager:
             with self._write_lock:
                 self._file_handle.write(json.dumps(event) + "\n")
                 self._file_handle.flush()
-        except Exception as e:
-            _LOGGER.error("Failed to write capture event: %s", e)
+        except Exception:
+            _LOGGER.error(
+                "Failed to write capture event:\n%s",
+                traceback.format_exc(),
+            )
 
     def start_capture_window(
         self, mac: str, lock_name: str, session_id: str
@@ -229,6 +291,15 @@ class ProtocolCaptureOnceManager:
         if not self._global_enabled:
             return
 
+        # Log first TX to prove hooks are working (rate-limited)
+        if not self._first_tx_logged:
+            self._first_tx_logged = True
+            _LOGGER.info(
+                "Protocol capture: First TX recorded for %s (%d bytes)",
+                mac,
+                len(plaintext),
+            )
+
         window = self._capture_windows.get(mac)
         if not window or not window.is_active():
             if window and not window.captured:  # Expired
@@ -283,6 +354,15 @@ class ProtocolCaptureOnceManager:
         """
         if not self._global_enabled:
             return
+
+        # Log first RX to prove hooks are working (rate-limited)
+        if not self._first_rx_logged:
+            self._first_rx_logged = True
+            _LOGGER.info(
+                "Protocol capture: First RX recorded for %s (%d bytes)",
+                mac,
+                len(plaintext),
+            )
 
         window = self._capture_windows.get(mac)
         if not window or not window.is_active():
