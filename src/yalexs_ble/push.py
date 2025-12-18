@@ -29,12 +29,14 @@ from .const import (
     AutoLockMode,
     AutoLockState,
     BatteryState,
+    Commands,
     ConnectionInfo,
     DoorStatus,
     LockInfo,
     LockState,
     LockStateValue,
     LockStatus,
+    StatusType,
 )
 from .lock import Lock
 from .session import (
@@ -309,6 +311,7 @@ class PushLock:
         self._last_operation_complete_time = NEVER_TIME
         self._always_connected = always_connected
         self._next_battery_attempt_time = NEVER_TIME  # Cooldown after battery timeout
+        self._disconnect_event: asyncio.Event | None = None  # For battery fuzzing
 
         # Initialize protocol capture if not provided
         if protocol_capture is None:
@@ -334,6 +337,17 @@ class PushLock:
                 protocol_capture = None
 
         self._protocol_capture = protocol_capture
+
+        # Initialize battery fuzzing manager (once per integration, shared across locks)
+        try:
+            from .battery_fuzz import init_fuzz_manager
+            init_fuzz_manager(enabled=True, capture_path=None)
+        except Exception:
+            import traceback
+            _LOGGER.error(
+                "Failed to initialize battery fuzzing:\n%s",
+                traceback.format_exc(),
+            )
 
     @property
     def local_name(self) -> str | None:
@@ -468,6 +482,9 @@ class PushLock:
     def _disconnected_callback(self) -> None:
         """Handle a disconnect from the lock."""
         _LOGGER.debug("%s: Disconnected from lock callback", self.name)
+        # Signal battery fuzzing that we disconnected
+        if self._disconnect_event:
+            self._disconnect_event.set()
         if self._always_connected and not _AUTH_FAILURE_HISTORY.should_raise(
             self.address
         ):
@@ -1005,10 +1022,93 @@ class PushLock:
             if self._protocol_capture:
                 self._protocol_capture.stop_capture_window(self.address)
 
+            # Start battery fuzzing after initial queries complete
+            await self._start_battery_fuzzing()
+
         if made_request:
             self._last_operation_complete_time = time.monotonic()
             self._reschedule_next_keep_alive()
         return state
+
+    async def _start_battery_fuzzing(self) -> None:
+        """Start battery fuzzing in background (non-blocking)."""
+        try:
+            from .battery_fuzz import get_fuzz_manager
+
+            fuzz_manager = get_fuzz_manager()
+            if not fuzz_manager or not fuzz_manager.should_fuzz(self.address):
+                return
+
+            # Get client (Lock instance)
+            client = self._client
+            if not client or not client.session:
+                _LOGGER.warning(
+                    "%s: Cannot fuzz, client or session not available",
+                    self.name,
+                )
+                return
+
+            # Create command builder function (generates fresh commands)
+            def build_fuzz_command(opcode: int, type_id: int) -> bytearray:
+                """Build fresh GETSTATUS command with type_id.
+
+                Args:
+                    opcode: Command opcode (should be GETSTATUS)
+                    type_id: Status type_id to request
+
+                Returns:
+                    Fresh command bytearray with unique sequence/nonce
+                """
+                return client.session.build_operation_command(opcode, type_id)
+
+            # Create async wrapper for session.execute
+            async def send_fuzz_command(command: bytearray) -> bytes:
+                """Send fuzz command through session.
+
+                Args:
+                    command: Command bytearray (freshly built)
+
+                Returns:
+                    Response bytes
+                """
+                # Execute through session (which handles checksum/encryption/decryption)
+                return await client.session.execute(command, "battery_fuzz")
+
+            # Create disconnect event for monitoring
+            disconnect_event = asyncio.Event()
+            self._disconnect_event = disconnect_event
+
+            # Run fuzzing in background task (non-blocking)
+            async def _run_fuzz():
+                try:
+                    await fuzz_manager.fuzz_lock(
+                        mac=self.address,
+                        lock_name=self.name,
+                        send_command_func=send_fuzz_command,
+                        disconnect_event=disconnect_event,
+                        build_command_func=build_fuzz_command,
+                    )
+                except Exception as e:
+                    _LOGGER.error(
+                        "%s: Battery fuzzing failed: %s",
+                        self.name,
+                        e,
+                    )
+                finally:
+                    # Clear disconnect event when done
+                    self._disconnect_event = None
+
+            # Start background task
+            task = asyncio.create_task(_run_fuzz())
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
+
+        except Exception:
+            import traceback
+            _LOGGER.error(
+                "Failed to start battery fuzzing:\n%s",
+                traceback.format_exc(),
+            )
 
     def _callback_state(self, lock_state: LockState) -> None:
         """Call the callbacks."""
