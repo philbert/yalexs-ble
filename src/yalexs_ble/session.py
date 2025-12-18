@@ -4,6 +4,7 @@ import asyncio
 import logging
 import time
 from collections.abc import Callable
+from typing import TYPE_CHECKING
 
 from async_interrupt import interrupt
 from bleak import BleakClient
@@ -17,6 +18,9 @@ from cryptography.hazmat.primitives.ciphers import (
 
 from . import util
 from .const import READ_CHARACTERISTIC, WRITE_CHARACTERISTIC
+
+if TYPE_CHECKING:
+    from .protocol_capture import ProtocolCaptureOnceManager
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -58,6 +62,8 @@ class Session:
         lock: asyncio.Lock,
         disconnected_futures: set[asyncio.Future[None]],
         state_callback: Callable[[bytes], None] | None = None,
+        protocol_capture: ProtocolCaptureOnceManager | None = None,
+        mac: str | None = None,
     ) -> None:
         """Init the session."""
         self.name = name
@@ -79,6 +85,8 @@ class Session:
         self._last_callback_time = -86400.0
         self._enable_cooldown = False
         self.loop = asyncio.get_running_loop()
+        self._protocol_capture = protocol_capture
+        self._mac = mac
 
     def set_key(self, key: bytes) -> None:
         self.cipher_encrypt = Cipher(
@@ -147,6 +155,18 @@ class Session:
             bool(self._notify_future),
         )
         decrypted_data = self.decrypt(data)
+
+        # Protocol capture hook (RX)
+        if self._protocol_capture and self._mac:
+            self._protocol_capture.record_rx(
+                mac=self._mac,
+                lock_name=self.name,
+                plaintext=bytes(decrypted_data),
+                encrypted=bytes(data),
+                characteristic_uuid=str(self.read_characteristic.uuid),
+                transport="notify",
+            )
+
         if self._state_callback:
             self._state_callback(decrypted_data)
         _LOGGER.debug(
@@ -173,11 +193,25 @@ class Session:
             raise BleakError("disconnected")
         assert self.cipher_encrypt is not None, "Cipher not set"  # nosec
         plainText = command[0x00:0x10]
+
+        # Save original plaintext for protocol capture before encryption
+        plaintext_copy = bytes(command) if self._protocol_capture else None
+
         cipherText = self.cipher_encrypt.update(plainText)
         util._copy(command, cipherText)
         _LOGGER.debug(
             "%s: Encrypted command %s: %s", self.name, command_name, command.hex()
         )
+
+        # Protocol capture hook (TX)
+        if self._protocol_capture and self._mac and plaintext_copy:
+            self._protocol_capture.record_tx(
+                mac=self._mac,
+                lock_name=self.name,
+                plaintext=plaintext_copy,
+                encrypted=bytes(command),
+                characteristic_uuid=str(self.write_characteristic.uuid),
+            )
 
         for attempt in range(3):
             future: asyncio.Future[bytes] = self.loop.create_future()

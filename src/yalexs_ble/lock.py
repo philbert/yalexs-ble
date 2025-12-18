@@ -6,7 +6,7 @@ import logging
 import os
 from collections.abc import Callable, Iterable
 from datetime import datetime
-from typing import Any, TypeVar, cast
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from bleak import BleakError
 from bleak_retry_connector import (
@@ -45,6 +45,9 @@ from .const import (
 )
 from .secure_session import SecureSession
 from .session import AuthError, DisconnectedError, Session, YaleXSBLEError
+
+if TYPE_CHECKING:
+    from .protocol_capture import ProtocolCaptureOnceManager
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -115,6 +118,8 @@ class Lock:
         state_callback: Callable[[Iterable[LockStateValue]], None],
         info: LockInfo | None = None,
         disconnect_callback: Callable[[], None] | None = None,
+        protocol_capture: ProtocolCaptureOnceManager | None = None,
+        mac: str | None = None,
     ) -> None:
         self.ble_device_callback = ble_device_callback
         self.key = bytes.fromhex(keyString)
@@ -130,6 +135,8 @@ class Lock:
         self._disconnected = False
         self._disconnect_callback = disconnect_callback
         self._disconnected_futures: set[asyncio.Future[None]] = set()
+        self._protocol_capture = protocol_capture
+        self._mac = mac
 
     def set_name(self, name: str) -> None:
         self.name = name
@@ -171,6 +178,8 @@ class Lock:
             self._lock,
             self._disconnected_futures,
             self._internal_state_callback,
+            self._protocol_capture,
+            self._mac,
         )
         self.secure_session = SecureSession(
             self.client,
@@ -178,6 +187,8 @@ class Lock:
             self._lock,
             self._disconnected_futures,
             self.key_index,
+            self._protocol_capture,
+            self._mac,
         )
         session = self.session
         secure_session = self.secure_session
@@ -299,6 +310,14 @@ class Lock:
         self.session.set_key(session_key)
         self.secure_session.enable_cooldown()
         self.session.enable_cooldown()
+
+        # Start protocol capture window after secure session established
+        if self._protocol_capture and self._mac:
+            import time
+            session_id = f"{self._mac}_{int(time.time())}"
+            self._protocol_capture.start_capture_window(
+                self._mac, self.name, session_id
+            )
 
     @raise_if_not_connected
     async def lock_info(self) -> LockInfo:

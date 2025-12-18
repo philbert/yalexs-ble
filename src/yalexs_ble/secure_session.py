@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from typing import TYPE_CHECKING
 
 from bleak import BleakClient
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
@@ -9,6 +10,9 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from . import util
 from .const import SECURE_READ_CHARACTERISTIC, SECURE_WRITE_CHARACTERISTIC
 from .session import ResponseError, Session
+
+if TYPE_CHECKING:
+    from .protocol_capture import ProtocolCaptureOnceManager
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -24,8 +28,10 @@ class SecureSession(Session):
         lock: asyncio.Lock,
         disconnected_futures: set[asyncio.Future[None]],
         key_index: int,
+        protocol_capture: ProtocolCaptureOnceManager | None = None,
+        mac: str | None = None,
     ) -> None:
-        super().__init__(client, name, lock, disconnected_futures)
+        super().__init__(client, name, lock, disconnected_futures, None, protocol_capture, mac)
         self.key_index = key_index
         self.write_characteristic = client.services.get_characteristic(
             self._write_characteristic

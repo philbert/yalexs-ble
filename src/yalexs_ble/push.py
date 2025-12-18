@@ -263,6 +263,8 @@ class PushLock:
         idle_disconnect_delay: float = DISCONNECT_DELAY,
         always_connected: bool = False,
         idle_disconnect_delay_pending_update: float = DISCONNECT_DELAY_PENDING_UPDATE,
+        # Hard-coded to True for new locks
+        protocol_capture: bool = True,
     ) -> None:
         """Init the lock watcher."""
         if local_name is None and address is None:
@@ -308,6 +310,7 @@ class PushLock:
         self._last_operation_complete_time = NEVER_TIME
         self._always_connected = always_connected
         self._next_battery_attempt_time = NEVER_TIME  # Cooldown after battery timeout
+        self._protocol_capture = protocol_capture
 
     @property
     def local_name(self) -> str | None:
@@ -435,6 +438,8 @@ class PushLock:
             self._state_callback,
             self._lock_info,
             self._disconnected_callback,
+            self._protocol_capture,
+            self.address,
         )
 
     def _disconnected_callback(self) -> None:
@@ -972,6 +977,10 @@ class PushLock:
             # we do not disconnect until it completes.
             self._next_disconnect_delay = FIRST_CONNECTION_DISCONNECT_TIME
             self._reset_disconnect_timer()
+
+            # Stop protocol capture window after first update completes
+            if self._protocol_capture:
+                self._protocol_capture.stop_capture_window(self.address)
 
         if made_request:
             self._last_operation_complete_time = time.monotonic()
