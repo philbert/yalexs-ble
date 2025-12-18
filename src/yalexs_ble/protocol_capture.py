@@ -16,7 +16,7 @@ from typing import Any
 _LOGGER = logging.getLogger(__name__)
 
 # Redaction configuration
-REDACT_PRESERVE_BYTES = 12  # Increase to 16 or 20 to capture more fields
+REDACT_PRESERVE_BYTES = 18  # Increase to 16 or 20 to capture more fields
 
 
 def _get_writable_capture_path() -> Path:
