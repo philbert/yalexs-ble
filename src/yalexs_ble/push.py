@@ -263,8 +263,7 @@ class PushLock:
         idle_disconnect_delay: float = DISCONNECT_DELAY,
         always_connected: bool = False,
         idle_disconnect_delay_pending_update: float = DISCONNECT_DELAY_PENDING_UPDATE,
-        # Hard-coded to True for new locks
-        protocol_capture: bool = True,
+        protocol_capture=None,
     ) -> None:
         """Init the lock watcher."""
         if local_name is None and address is None:

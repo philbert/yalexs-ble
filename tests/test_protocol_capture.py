@@ -24,9 +24,9 @@ def test_redact_bytes_enabled():
     """Test redaction when enabled."""
     data = b"\xee\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f"
     result = redact_bytes(data, redact=True)
-    # Should preserve first 4 bytes and redact the rest
-    assert result.startswith("ee010203")
-    assert "<REDACTED:12bytes>" in result
+    # Should preserve first 12 bytes (24 hex chars) and truncate the rest
+    assert result == "ee0102030405060708090a0b"
+    assert len(result) == 24  # 12 bytes = 24 hex chars
 
 
 def test_redact_bytes_short():
@@ -224,9 +224,9 @@ def test_redaction_enabled():
         tx_events = [e for e in events if e.get("direction") == "tx"]
         assert len(tx_events) == 1
 
-        # Check redaction
-        assert tx_events[0]["plaintext_hex"].startswith("ee010203")
-        assert "<REDACTED:" in tx_events[0]["plaintext_hex"]
+        # Check redaction - plaintext_hex should be pure hex (first 12 bytes)
+        assert tx_events[0]["plaintext_hex"] == "ee0102030405060708090a0b"
+        assert tx_events[0]["plaintext_redacted_bytes"] == 4  # 16 - 12 = 4 bytes redacted
         assert tx_events[0]["encrypted_hex"] == "<REDACTED:16bytes>"
         assert tx_events[0]["plaintext_len"] == 16
         assert tx_events[0]["encrypted_len"] == 16
@@ -262,8 +262,8 @@ def test_correlation_id():
 
         comm_events = [e for e in events if e.get("direction")]
 
-        # Check correlation IDs
+        # Check correlation IDs are monotonic (each event gets unique ID)
         assert comm_events[0]["correlation_id"] == 1  # First TX
-        assert comm_events[1]["correlation_id"] == 1  # First RX (same)
-        assert comm_events[2]["correlation_id"] == 2  # Second TX
-        assert comm_events[3]["correlation_id"] == 2  # Second RX (same)
+        assert comm_events[1]["correlation_id"] == 2  # First RX (monotonic)
+        assert comm_events[2]["correlation_id"] == 3  # Second TX
+        assert comm_events[3]["correlation_id"] == 4  # Second RX (monotonic)

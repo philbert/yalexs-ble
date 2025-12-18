@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -12,29 +13,30 @@ from typing import Any
 
 _LOGGER = logging.getLogger(__name__)
 
+# Redaction configuration
+REDACT_PRESERVE_BYTES = 12  # Increase to 16 or 20 to capture more fields
+
 
 def redact_bytes(data: bytes, redact: bool) -> str:
     """Redact sensitive bytes while preserving structure for analysis.
 
     Args:
         data: Raw bytes to redact
-        redact: If False, return full hex; if True, preserve first 4 bytes for structure
+        redact: If False, return full hex; if True, preserve first N bytes for structure
 
     Returns:
-        Hex string or redacted placeholder
+        Hex string (pure hex only, possibly truncated)
     """
     if not redact:
         return data.hex()
 
-    if len(data) <= 4:
-        # Too short to redact safely
+    if len(data) <= REDACT_PRESERVE_BYTES:
+        # Short messages - likely commands/status, safe to show
         return data.hex()
 
-    # Preserve first 4 bytes for protocol structure analysis
+    # Preserve first N bytes for protocol structure analysis
     # Redact remaining bytes (likely secrets/high-entropy data)
-    prefix = data[:4].hex()
-    redacted_len = len(data) - 4
-    return f"{prefix}<REDACTED:{redacted_len}bytes>"
+    return data[:REDACT_PRESERVE_BYTES].hex()
 
 
 @dataclass
@@ -94,9 +96,14 @@ class ProtocolCaptureOnceManager:
         self._file_handle = None
         self._capture_started = False
         self._capture_finished = False
+        self._write_lock = threading.Lock()
 
         if self._enabled:
             self._init_capture_file()
+            # Auto-finalize after timeout if no activity
+            timer = threading.Timer(300.0, self._auto_finalize)  # 5 minutes
+            timer.daemon = True
+            timer.start()
 
     def _init_capture_file(self) -> None:
         """Initialize capture file and write header."""
@@ -150,8 +157,9 @@ class ProtocolCaptureOnceManager:
             return
 
         try:
-            self._file_handle.write(json.dumps(event) + "\n")
-            self._file_handle.flush()
+            with self._write_lock:
+                self._file_handle.write(json.dumps(event) + "\n")
+                self._file_handle.flush()
         except Exception as e:
             _LOGGER.error("Failed to write capture event: %s", e)
 
@@ -223,6 +231,10 @@ class ProtocolCaptureOnceManager:
 
         window = self._capture_windows.get(mac)
         if not window or not window.is_active():
+            if window and not window.captured:  # Expired
+                window.captured = True
+                self._captured_macs.add(mac)
+                self._check_global_done()
             return
 
         event = {
@@ -237,6 +249,9 @@ class ProtocolCaptureOnceManager:
             "plaintext_len": len(plaintext),
             "correlation_id": window.next_correlation_id(),
         }
+
+        if self._redact and len(plaintext) > REDACT_PRESERVE_BYTES:
+            event["plaintext_redacted_bytes"] = len(plaintext) - REDACT_PRESERVE_BYTES
 
         if encrypted:
             if self._redact:
@@ -271,6 +286,10 @@ class ProtocolCaptureOnceManager:
 
         window = self._capture_windows.get(mac)
         if not window or not window.is_active():
+            if window and not window.captured:  # Expired
+                window.captured = True
+                self._captured_macs.add(mac)
+                self._check_global_done()
             return
 
         event = {
@@ -283,8 +302,11 @@ class ProtocolCaptureOnceManager:
             "characteristic_uuid": characteristic_uuid,
             "plaintext_hex": redact_bytes(plaintext, self._redact),
             "plaintext_len": len(plaintext),
-            "correlation_id": window.correlation_id,  # Same as matching TX
+            "correlation_id": window.next_correlation_id(),  # Monotonic RX sequence
         }
+
+        if self._redact and len(plaintext) > REDACT_PRESERVE_BYTES:
+            event["plaintext_redacted_bytes"] = len(plaintext) - REDACT_PRESERVE_BYTES
 
         if encrypted:
             if self._redact:
@@ -300,14 +322,28 @@ class ProtocolCaptureOnceManager:
         if self._capture_finished:
             return
 
+        # Mark expired windows as captured before checking
+        for window in self._capture_windows.values():
+            if not window.captured and not window.is_active():
+                window.captured = True
+                self._captured_macs.add(window.mac)
+
         # Check if all active windows are done
         all_done = all(
             window.captured or not window.is_active()
             for window in self._capture_windows.values()
         )
 
-        if all_done and self._capture_windows:
+        if all_done:
             self._finalize_capture()
+
+    def _auto_finalize(self) -> None:
+        """Auto-finalize on timeout - mark expired windows first."""
+        for window in self._capture_windows.values():
+            if not window.captured and not window.is_active():
+                window.captured = True
+                self._captured_macs.add(window.mac)
+        self._check_global_done()
 
     def _finalize_capture(self) -> None:
         """Write footer and close capture file."""
@@ -337,6 +373,12 @@ class ProtocolCaptureOnceManager:
 
     def shutdown(self) -> None:
         """Clean shutdown of capture manager."""
+        # Mark all expired windows before finalizing
+        for window in self._capture_windows.values():
+            if not window.captured and not window.is_active():
+                window.captured = True
+                self._captured_macs.add(window.mac)
+
         if not self._capture_finished and self._capture_started:
             self._finalize_capture()
         elif self._file_handle:
