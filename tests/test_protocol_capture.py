@@ -22,11 +22,11 @@ def test_redact_bytes_disabled():
 
 def test_redact_bytes_enabled():
     """Test redaction when enabled."""
-    data = b"\xee\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f"
+    data = b"\xee\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10\x11"
     result = redact_bytes(data, redact=True)
-    # Should preserve first 12 bytes (24 hex chars) and truncate the rest
-    assert result == "ee0102030405060708090a0b"
-    assert len(result) == 24  # 12 bytes = 24 hex chars
+    # Should preserve first 18 bytes (36 hex chars) and truncate the rest
+    assert result == "ee0102030405060708090a0b0c0d0e0f1011"
+    assert len(result) == 36  # 18 bytes = 36 hex chars
 
 
 def test_redact_bytes_short():
@@ -206,9 +206,9 @@ def test_redaction_enabled():
 
         manager.start_capture_window(mac, lock_name, session_id)
 
-        # Record with encryption data
-        plaintext = b"\xee\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f"
-        encrypted = b"\x11\x22\x33\x44\x55\x66\x77\x88\x99\xaa\xbb\xcc\xdd\xee\xff\x00"
+        # Record with encryption data (20 bytes to test redaction)
+        plaintext = b"\xee\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10\x11\x12\x13"
+        encrypted = b"\x11\x22\x33\x44\x55\x66\x77\x88\x99\xaa\xbb\xcc\xdd\xee\xff\x00\x01\x02\x03\x04"
 
         manager.record_tx(mac, lock_name, plaintext, encrypted)
 
@@ -224,12 +224,12 @@ def test_redaction_enabled():
         tx_events = [e for e in events if e.get("direction") == "tx"]
         assert len(tx_events) == 1
 
-        # Check redaction - plaintext_hex should be pure hex (first 12 bytes)
-        assert tx_events[0]["plaintext_hex"] == "ee0102030405060708090a0b"
-        assert tx_events[0]["plaintext_redacted_bytes"] == 4  # 16 - 12 = 4 bytes redacted
-        assert tx_events[0]["encrypted_hex"] == "<REDACTED:16bytes>"
-        assert tx_events[0]["plaintext_len"] == 16
-        assert tx_events[0]["encrypted_len"] == 16
+        # Check redaction - plaintext_hex should be pure hex (first 18 bytes)
+        assert tx_events[0]["plaintext_hex"] == "ee0102030405060708090a0b0c0d0e0f1011"
+        assert tx_events[0]["plaintext_redacted_bytes"] == 2  # 20 - 18 = 2 bytes redacted
+        assert tx_events[0]["encrypted_hex"] == "<REDACTED:20bytes>"
+        assert tx_events[0]["plaintext_len"] == 20
+        assert tx_events[0]["encrypted_len"] == 20
 
 
 def test_correlation_id():

@@ -323,7 +323,7 @@ class PushLock:
                     enabled=True,
                     capture_path=None,  # Auto-detect writable path
                     redact=True,
-                    window_duration=15.0,
+                    window_duration=120.0,  # 2 minutes to capture more data
                 )
             except Exception as e:
                 import traceback
