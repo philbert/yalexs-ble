@@ -1,10 +1,12 @@
 import asyncio
 import time
+from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from bleak.backends.scanner import AdvertisementData
 from bleak.exc import BleakDBusError, BleakError
+from bleak_retry_connector import BleakNotFoundError
 
 from yalexs_ble.const import (
     AutoLockMode,
@@ -15,6 +17,7 @@ from yalexs_ble.const import (
     LockState,
     LockStatus,
 )
+from yalexs_ble import push as push_module
 from yalexs_ble.push import (
     NEVER_TIME,
     NO_BATTERY_SUPPORT_MODELS,
@@ -23,6 +26,9 @@ from yalexs_ble.push import (
     SLOW_MIN_INTERVAL,
     SLOW_TIMEOUT,
     PushLock,
+    T_DISCONNECT_SECONDS,
+    T_OK_SECONDS,
+    T_PRESENCE_SECONDS,
     operation_lock,
     retry_bluetooth_connection_error,
 )
@@ -723,3 +729,164 @@ async def test_update_handles_connection_params_failure():
 
     assert final_state.lock == LockStatus.LOCKED
     mock_client.set_connection_params.assert_called_once()
+
+
+def test_connection_health_success_then_stale_degraded() -> None:
+    push_lock = PushLock(
+        address="aa:bb:cc:dd:ee:ff",
+        key="0800200c9a66",
+        key_index=1,
+        always_connected=False,
+    )
+    push_lock._name = "Test Lock"
+    base = datetime(2024, 1, 1, 0, 0, 0)
+
+    with patch.object(push_module, "_now", return_value=base):
+        push_lock._record_auth_success()
+
+    with patch.object(
+        push_module, "_now", return_value=base + timedelta(seconds=T_OK_SECONDS + 1)
+    ):
+        health = push_lock.connection_health
+
+    assert health.state == "degraded"
+    assert health.last_success == base
+
+
+def test_connection_health_presence_without_success_degraded() -> None:
+    push_lock = PushLock(
+        address="aa:bb:cc:dd:ee:ff",
+        key="0800200c9a66",
+        key_index=1,
+        always_connected=False,
+    )
+    push_lock._name = "Test Lock"
+    base = datetime(2024, 1, 1, 0, 0, 0)
+
+    with patch.object(push_module, "_now", return_value=base):
+        push_lock._mark_presence_seen()
+
+    with patch.object(
+        push_module, "_now", return_value=base + timedelta(seconds=T_PRESENCE_SECONDS)
+    ):
+        health = push_lock.connection_health
+
+    assert health.state == "degraded"
+    assert health.last_success is None
+
+
+def test_connection_health_presence_lost_disconnected() -> None:
+    push_lock = PushLock(
+        address="aa:bb:cc:dd:ee:ff",
+        key="0800200c9a66",
+        key_index=1,
+        always_connected=False,
+    )
+    push_lock._name = "Test Lock"
+    base = datetime(2024, 1, 1, 0, 0, 0)
+
+    with patch.object(push_module, "_now", return_value=base):
+        push_lock._mark_presence_seen()
+
+    with patch.object(
+        push_module,
+        "_now",
+        return_value=base + timedelta(seconds=T_DISCONNECT_SECONDS + 1),
+    ):
+        health = push_lock.connection_health
+
+    assert health.state == "disconnected"
+
+
+def test_connection_health_failure_counters() -> None:
+    push_lock = PushLock(
+        address="aa:bb:cc:dd:ee:ff",
+        key="0800200c9a66",
+        key_index=1,
+        always_connected=False,
+    )
+    push_lock._name = "Test Lock"
+    base = datetime(2024, 1, 1, 0, 0, 0)
+
+    with patch.object(push_module, "_now", return_value=base):
+        push_lock._record_auth_failure(RuntimeError("boom"))
+
+    assert push_lock.connection_health.consecutive_failures == 1
+    assert push_lock.connection_health.last_error == "RuntimeError"
+
+    with patch.object(
+        push_module, "_now", return_value=base + timedelta(seconds=1)
+    ):
+        push_lock._record_auth_failure(ValueError("fail"))
+
+    assert push_lock.connection_health.consecutive_failures == 2
+    assert push_lock.connection_health.last_error == "ValueError"
+
+
+def test_connection_info_includes_health() -> None:
+    push_lock = PushLock(
+        address="aa:bb:cc:dd:ee:ff",
+        key="0800200c9a66",
+        key_index=1,
+        always_connected=False,
+    )
+    push_lock._name = "Test Lock"
+    push_lock._advertisement_data = AdvertisementData(
+        local_name="Test Lock",
+        service_data={},
+        service_uuids=[],
+        rssi=-42,
+        manufacturer_data={},
+        platform_data=(),
+        tx_power=0,
+    )
+    base = datetime(2024, 1, 1, 0, 0, 0)
+
+    with patch.object(push_module, "_now", return_value=base):
+        push_lock._record_auth_success()
+        connection_info = push_lock.connection_info
+
+    assert connection_info is not None
+    assert connection_info.health is not None
+    assert connection_info.health.state == "connected"
+    assert connection_info.health.last_success == base
+
+
+@pytest.mark.asyncio
+async def test_lock_operation_failure_preserves_known_state() -> None:
+    push_lock = PushLock(
+        address="aa:bb:cc:dd:ee:ff",
+        key="0800200c9a66",
+        key_index=1,
+        always_connected=False,
+    )
+    push_lock._name = "Test Lock"
+    push_lock._running = True
+    push_lock._lock_state = LockState(
+        lock=LockStatus.LOCKED,
+        door=DoorStatus.CLOSED,
+        battery=None,
+        auth=None,
+        auto_lock=None,
+        auto_lock_prev=None,
+    )
+    base = datetime(2024, 1, 1, 0, 0, 0)
+
+    with patch.object(push_module, "_now", return_value=base):
+        push_lock._mark_presence_seen()
+        with patch.object(
+            push_lock,
+            "_ensure_connected",
+            AsyncMock(side_effect=BleakNotFoundError("not found")),
+        ):
+            with pytest.raises(BleakNotFoundError):
+                await push_lock._execute_lock_operation(
+                    "force_unlock", LockStatus.UNLOCKING, LockStatus.UNLOCKED
+                )
+        health = push_lock.connection_health
+
+    assert push_lock.lock_status == LockStatus.LOCKED
+    assert health.state == "degraded"
+    assert health.consecutive_failures == 1
+    assert health.last_error == "BleakNotFoundError"
+

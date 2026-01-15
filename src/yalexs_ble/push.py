@@ -7,6 +7,7 @@ import struct
 import time
 from collections.abc import Callable, Coroutine, Iterable
 from dataclasses import replace
+from datetime import datetime
 from typing import Any, TypeVar, cast
 
 from bleak.backends.scanner import AdvertisementData
@@ -29,6 +30,7 @@ from .const import (
     AutoLockMode,
     AutoLockState,
     BatteryState,
+    ConnectionHealth,
     ConnectionInfo,
     DoorStatus,
     LockInfo,
@@ -67,6 +69,10 @@ DISCONNECT_DELAY_PENDING_UPDATE = 12.5
 RESYNC_DELAY = 0.01
 
 KEEP_ALIVE_TIME = 25.0  # Lock will disconnect after 30 seconds of inactivity
+
+T_OK_SECONDS = 120
+T_PRESENCE_SECONDS = 90
+T_DISCONNECT_SECONDS = 900
 
 # Number of seconds to wait after the first connection
 # to disconnect to free up the bluetooth adapter.
@@ -124,6 +130,10 @@ NO_BATTERY_SUPPORT_MODELS = {
 }
 
 AUTO_LOCK_DEFAULT_DURATION = 90
+
+
+def _now() -> datetime:
+    return datetime.now()
 
 
 def operation_lock(func: WrapFuncType) -> WrapFuncType:
@@ -317,6 +327,12 @@ class PushLock:
         self._always_connected = always_connected
         self._slow_params_set = False
         self._next_battery_attempt_time = NEVER_TIME  # Cooldown after battery timeout
+        self._last_auth_success: datetime | None = None
+        self._last_auth_failure: datetime | None = None
+        self._last_presence_seen: datetime | None = None
+        self._consecutive_failures = 0
+        self._last_error: str | None = None
+        self._health_state: str | None = None
 
     @property
     def local_name(self) -> str | None:
@@ -381,10 +397,26 @@ class PushLock:
         return self._lock_info
 
     @property
+    def connection_health(self) -> ConnectionHealth:
+        """Return the current connection health."""
+        now = _now()
+        self._update_health_state("connection_health", now)
+        return ConnectionHealth(
+            state=self._compute_connection_state(now),
+            last_success=self._last_auth_success,
+            last_failure=self._last_auth_failure,
+            consecutive_failures=self._consecutive_failures,
+            last_error=self._last_error,
+            last_presence_seen=self._last_presence_seen,
+        )
+
+    @property
     def connection_info(self) -> ConnectionInfo | None:
         """Return the current connection info."""
         if self._advertisement_data:
-            return ConnectionInfo(self._advertisement_data.rssi)
+            info = ConnectionInfo(self._advertisement_data.rssi)
+            info.health = self.connection_health
+            return info
         return None
 
     @property
@@ -405,6 +437,47 @@ class PushLock:
         """Reset the advertisement state."""
         self._last_adv_value = -1
         self._last_hk_state = -1
+
+    def _compute_connection_state(self, now: datetime) -> str:
+        if (
+            self._last_auth_success
+            and (now - self._last_auth_success).total_seconds() <= T_OK_SECONDS
+        ):
+            return "connected"
+        # Presence signals are weaker than authenticated operations.
+        if (
+            self._last_presence_seen
+            and (now - self._last_presence_seen).total_seconds() <= T_PRESENCE_SECONDS
+        ):
+            return "degraded"
+        if (
+            self._last_presence_seen is None
+            or (now - self._last_presence_seen).total_seconds() >= T_DISCONNECT_SECONDS
+        ):
+            return "disconnected"
+        return "degraded"
+
+    def _update_health_state(self, reason: str, now: datetime | None = None) -> None:
+        if now is None:
+            now = _now()
+        new_state = self._compute_connection_state(now)
+        if new_state == self._health_state:
+            return
+        _LOGGER.debug(
+            "%s: Connection state changed (%s): %s -> %s "
+            "(last_success=%s, last_failure=%s, last_presence=%s, "
+            "consecutive_failures=%s, last_error=%s)",
+            self.name,
+            reason,
+            self._health_state,
+            new_state,
+            self._last_auth_success,
+            self._last_auth_failure,
+            self._last_presence_seen,
+            self._consecutive_failures,
+            self._last_error,
+        )
+        self._health_state = new_state
 
     def register_callback(
         self, callback: Callable[[LockState, LockInfo, ConnectionInfo], None]
@@ -504,6 +577,24 @@ class PushLock:
         self._disconnect_timer = self.loop.call_later(
             timeout, self._disconnect_with_timer, timeout
         )
+
+    def _mark_presence_seen(self) -> None:
+        self._last_presence_seen = _now()
+        self._update_health_state("presence")
+
+    def _record_auth_success(self) -> None:
+        now = _now()
+        self._last_auth_success = now
+        self._last_presence_seen = now
+        self._consecutive_failures = 0
+        self._last_error = None
+        self._update_health_state("auth_success", now)
+
+    def _record_auth_failure(self, exc: Exception) -> None:
+        self._last_auth_failure = _now()
+        self._consecutive_failures += 1
+        self._last_error = type(exc).__name__
+        self._update_health_state("auth_failure")
 
     async def _execute_forced_disconnect(self, reason: str) -> None:
         """Execute forced disconnection."""
@@ -658,6 +749,7 @@ class PushLock:
                 f"{self.name}: Lock operation not possible because not running"
             )
         _LOGGER.debug("%s: Starting %s", self.name, pending_state)
+        previous_lock_status = self.lock_status
         self._update_any_state([pending_state])
         self._cancel_future_update()
         try:
@@ -665,7 +757,11 @@ class PushLock:
             self._cancel_future_update()
             await getattr(lock, op_attr)()
         except Exception as ex:
-            self._update_any_state([LockStatus.UNKNOWN])
+            self._record_auth_failure(ex)
+            if previous_lock_status != LockStatus.UNKNOWN:
+                self._update_any_state([previous_lock_status])
+            else:
+                self._update_any_state([LockStatus.UNKNOWN])
             _LOGGER.debug(
                 "%s: Failed to execute lock operation due to %s, forcing disconnect",
                 self.name,
@@ -735,6 +831,7 @@ class PushLock:
             self._cancel_future_update()
             await lock.set_auto_lock(mode, duration)
         except Exception as ex:
+            self._record_auth_failure(ex)
             _LOGGER.debug(
                 "%s: Failed to execute set auto lock operation due to %s, "
                 "forcing disconnect",
@@ -747,11 +844,13 @@ class PushLock:
     def _complete_operation(self, now: float) -> None:
         """Mark an operation as complete and reset timers."""
         self._last_operation_complete_time = now
+        self._record_auth_success()
         self._reset_disconnect_timer()
         self._reschedule_next_keep_alive()
 
     def _state_callback(self, states: Iterable[LockStateValue]) -> None:
         """Handle state change."""
+        self._mark_presence_seen()
         self._reset_disconnect_timer()
         self._update_any_state(states)
 
@@ -1002,6 +1101,7 @@ class PushLock:
         if made_request:
             self._last_operation_complete_time = time.monotonic()
             self._reschedule_next_keep_alive()
+        self._record_auth_success()
         return state
 
     async def _set_slow_connection_params(self, lock: Lock) -> None:
@@ -1067,6 +1167,7 @@ class PushLock:
                 )
         else:
             return
+        self._mark_presence_seen()
         self.set_ble_device(ble_device)
         self.set_advertisement_data(ad)
         next_update = 0.0
@@ -1272,6 +1373,7 @@ class PushLock:
             await self._update()
             self._set_update_state(None)
         except AuthError as ex:
+            self._record_auth_failure(ex)
             self._set_update_state(ex)
             _LOGGER.exception(
                 "%s: Auth error: key or slot (key index) is incorrect",
@@ -1282,24 +1384,29 @@ class PushLock:
             _LOGGER.debug("%s: In-progress update canceled", self.name)
             raise
         except TimeoutError as ex:
+            self._record_auth_failure(ex)
             self._set_update_state(ex)
             _LOGGER.exception("%s: Timed out updating", self.name)
         except BleakNotFoundError as ex:
+            self._record_auth_failure(ex)
             wrapped_bleak_exc = BluetoothError(str(ex))
             wrapped_bleak_exc.__cause__ = ex
             self._set_update_state(wrapped_bleak_exc)
             _LOGGER.debug("%s: not found error updating", self.name, exc_info=True)
         except BleakError as ex:
+            self._record_auth_failure(ex)
             wrapped_bleak_exc = BluetoothError(str(ex))
             wrapped_bleak_exc.__cause__ = ex
             self._set_update_state(wrapped_bleak_exc)
             _LOGGER.exception("%s: Bluetooth error updating", self.name)
         except DisconnectedError as ex:
+            self._record_auth_failure(ex)
             wrapped_bleak_exc = BluetoothError(str(ex))
             wrapped_bleak_exc.__cause__ = ex
             self._set_update_state(wrapped_bleak_exc)
             _LOGGER.exception("%s: Disconnected while updating", self.name)
         except Exception as ex:  # pylint: disable=broad-except
+            self._record_auth_failure(ex)
             wrapped_exc = YaleXSBLEError(str(ex))
             wrapped_exc.__cause__ = ex
             self._set_update_state(wrapped_exc)
