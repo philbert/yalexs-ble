@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum, IntEnum
-from typing import TypedDict
+from typing import Literal, TypedDict
 
 COMMAND_SERVICE_UUID = "0000fe24-0000-1000-8000-00805f9b34fb"
 WRITE_CHARACTERISTIC = "bd4ac611-0b45-11e3-8ffd-0800200c9a66"
@@ -180,8 +180,20 @@ class LockInfo:
 
 
 @dataclass
+class ConnectionHealth:
+    state: Literal["connected", "degraded", "disconnected"]
+    last_success: datetime | None
+    last_failure: datetime | None
+    consecutive_failures: int
+    last_error: str | None
+    last_presence_seen: datetime | None
+    adapter: str | None = None
+
+
+@dataclass
 class ConnectionInfo:
     rssi: int
+    health: ConnectionHealth | None = None
 
 
 class YaleXSBLEDiscovery(TypedDict):
