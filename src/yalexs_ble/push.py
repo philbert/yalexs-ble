@@ -356,6 +356,7 @@ class PushLock:
         self._always_connected = always_connected
         self._slow_params_set = False
         self._next_battery_attempt_time = NEVER_TIME  # Cooldown after battery timeout
+        self._get_log_drained_this_session: bool = False
         self._last_auth_success: datetime | None = None
         self._last_auth_failure: datetime | None = None
         self._last_presence_seen: datetime | None = None
@@ -759,6 +760,7 @@ class PushLock:
             self._next_disconnect_delay = self._idle_disconnect_delay
             self._reset_disconnect_timer()
             self._seen_this_session.clear()
+            self._get_log_drained_this_session = False
             self._slow_params_set = False
             return self._client
 
@@ -1187,6 +1189,27 @@ class PushLock:
             # we do not disconnect until it completes.
             self._next_disconnect_delay = FIRST_CONNECTION_DISCONNECT_TIME
             self._reset_disconnect_timer()
+
+        # Drain any queued activity log entries while the connection is already
+        # open. This runs once per BLE session (reset when a new connection is
+        # established in _ensure_connected). Best-effort: if the lock does not
+        # support GET_LOG (0x2D) or disconnects while draining, we log and
+        # continue — the state update above already succeeded.
+        if not self._get_log_drained_this_session:
+            self._get_log_drained_this_session = True
+            try:
+                while (await lock.lock_activity()) is not None:
+                    pass
+            except (
+                AuthError,
+                DisconnectedError,
+                TimeoutError,
+                BleakError,
+                BleakDBusError,
+            ) as err:
+                _LOGGER.debug(
+                    "%s: Activity log drain at startup failed: %s", self.name, err
+                )
 
         if self._always_connected and made_request:
             await self._set_slow_connection_params(lock)
