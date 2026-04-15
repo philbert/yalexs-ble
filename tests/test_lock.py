@@ -12,6 +12,7 @@ from yalexs_ble.const import (
     AutoLockState,
     BatteryState,
     Commands,
+    DoorActivity,
     DoorStatus,
     FIRMWARE_REVISION_CHARACTERISTIC,
     LockActivity,
@@ -370,6 +371,83 @@ async def test_battery_level_returns_none_for_implausible_frame(lock: Lock) -> N
         battery_state = await lock.battery_level()
 
     assert battery_state is None
+
+
+@pytest.mark.asyncio
+async def test_get_log_entry_sends_raw_0x2d(lock: Lock) -> None:
+    """Test that get_log_entry uses the raw 0x2D command path."""
+    lock.client = MagicMock(is_connected=True)
+    lock.session = MagicMock()
+    lock.secure_session = MagicMock()
+
+    response = bytes.fromhex("bb2d00000000050378563412000000001f00")
+    with (
+        patch.object(
+            lock, "_execute_simple_command", AsyncMock(return_value=response)
+        ) as mock_execute,
+        patch.object(lock, "_parse_lock_activity") as mock_parse,
+    ):
+        activity = LockActivity(
+            timestamp=datetime(2024, 1, 1, 12, 0),
+            status=LockStatus.UNLOCKED,
+            source=LockOperationSource.REMOTE,
+            remote_type=LockOperationRemoteType.BLE,
+        )
+        mock_parse.return_value = activity
+
+        result = await lock.get_log_entry()
+
+    assert result == activity
+    mock_execute.assert_awaited_once_with(Commands.LOCK_ACTIVITY.value, "get_log_entry")
+    mock_parse.assert_called_once_with(response)
+
+
+@pytest.mark.asyncio
+async def test_get_log_drains_until_no_more_entries(lock: Lock) -> None:
+    """Test that get_log keeps polling until the lock reports no more entries."""
+    lock.client = MagicMock(is_connected=True)
+    lock.session = MagicMock()
+    lock.secure_session = MagicMock()
+
+    first = DoorActivity(datetime(2024, 1, 1, 12, 0), DoorStatus.CLOSED)
+    second = LockActivity(
+        timestamp=datetime(2024, 1, 1, 12, 1),
+        status=LockStatus.LOCKED,
+        source=LockOperationSource.MANUAL,
+    )
+    with patch.object(
+        lock, "_get_log_entry", AsyncMock(side_effect=[first, second, None])
+    ) as mock_get_log_entry:
+        result = await lock.get_log()
+
+    assert result == [first, second]
+    assert mock_get_log_entry.await_count == 3
+
+
+@pytest.mark.asyncio
+async def test_get_log_respects_max_entries(lock: Lock) -> None:
+    """Test that get_log stops once max_entries is reached."""
+    lock.client = MagicMock(is_connected=True)
+    lock.session = MagicMock()
+    lock.secure_session = MagicMock()
+
+    entry = DoorActivity(datetime(2024, 1, 1, 12, 0), DoorStatus.CLOSED)
+    with patch.object(lock, "_get_log_entry", AsyncMock(return_value=entry)) as mock_get_log_entry:
+        result = await lock.get_log(max_entries=2)
+
+    assert result == [entry, entry]
+    assert mock_get_log_entry.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_get_log_rejects_negative_max_entries(lock: Lock) -> None:
+    """Test that get_log fails fast on invalid limits."""
+    lock.client = MagicMock(is_connected=True)
+    lock.session = MagicMock()
+    lock.secure_session = MagicMock()
+
+    with pytest.raises(ValueError, match="max_entries must be >= 0"):
+        await lock.get_log(max_entries=-1)
 
 
 def test_parse_bb_response_lock_activity(lock: Lock) -> None:

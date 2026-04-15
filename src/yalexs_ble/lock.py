@@ -495,6 +495,26 @@ class Lock:
         )
         return response
 
+    async def _execute_simple_command(self, opcode: int, command_name: str) -> bytes:
+        assert self.session is not None  # nosec
+        command = self.session.build_command(opcode)
+        _LOGGER.debug(
+            "%s: %s raw request: [%s] [%s]",
+            self.name,
+            command_name,
+            command.hex(),
+            hex(opcode),
+        )
+        response = await self.session.execute(command, command_name)
+        _LOGGER.debug(
+            "%s: %s raw response: [%s] [%s]",
+            self.name,
+            command_name,
+            response.hex(),
+            hex(opcode),
+        )
+        return response
+
     def _parse_lock_and_door_state(
         self, response: bytes
     ) -> tuple[LockStatus, DoorStatus]:
@@ -703,15 +723,56 @@ class Lock:
         _LOGGER.warning("%s: Unknown activity type: 0x%02X", self.name, activity_type)
         return None
 
+    async def _get_log_entry(
+        self, command_name: str
+    ) -> DoorActivity | LockActivity | None:
+        assert self.session is not None  # nosec
+        response = await self._execute_simple_command(
+            Commands.LOCK_ACTIVITY.value, command_name
+        )
+        return self._parse_lock_activity(response)
+
     @raise_if_not_connected
     async def lock_activity(self) -> DoorActivity | LockActivity | None:
         _LOGGER.debug("%s: Executing lock_activity", self.name)
-        assert self.session is not None  # nosec
-        response = await self.session.execute(
-            self.session.build_command(Commands.LOCK_ACTIVITY.value), "lock_activity"
-        )
+        entry = await self._get_log_entry("lock_activity")
         _LOGGER.debug("%s: Finished executing lock_activity", self.name)
-        return self._parse_lock_activity(response)
+        return entry
+
+    @raise_if_not_connected
+    async def get_log_entry(self) -> DoorActivity | LockActivity | None:
+        """Get the next unread lock log entry from the lock."""
+        _LOGGER.debug("%s: Executing get_log_entry", self.name)
+        entry = await self._get_log_entry("get_log_entry")
+        _LOGGER.debug("%s: Finished executing get_log_entry", self.name)
+        return entry
+
+    @raise_if_not_connected
+    async def get_log(
+        self, max_entries: int | None = None
+    ) -> list[DoorActivity | LockActivity]:
+        """Drain unread lock log entries from the lock."""
+        if max_entries is not None and max_entries < 0:
+            raise ValueError("max_entries must be >= 0")
+
+        _LOGGER.debug(
+            "%s: Executing get_log%s",
+            self.name,
+            "" if max_entries is None else f" (max_entries={max_entries})",
+        )
+        entries: list[DoorActivity | LockActivity] = []
+        while max_entries is None or len(entries) < max_entries:
+            entry = await self._get_log_entry("get_log")
+            if entry is None:
+                break
+            entries.append(entry)
+        _LOGGER.debug(
+            "%s: Finished executing get_log with %s entr%s",
+            self.name,
+            len(entries),
+            "y" if len(entries) == 1 else "ies",
+        )
+        return entries
 
     async def disconnect(self) -> None:
         """Disconnect from the lock."""
