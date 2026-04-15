@@ -94,8 +94,10 @@ VALUE_TO_AUTO_LOCK_MODE = {status.value: status for status in AutoLockMode}
 
 class LockActivityType(Enum):
     LOCK = 0x00
-    DOOR = 0x20
     PIN = 0x0E
+    DOOR_SENSE = 0x17  # door sensor event; same wire layout as DOOR (observed fw 3.0.2)
+    DOOR = 0x20
+    UNKNOWN_40 = 0x40  # seen on fw 3.0.2 after lock ops; layout not yet determined
     NONE = 0x80
 
 

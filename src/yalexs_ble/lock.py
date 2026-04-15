@@ -683,9 +683,14 @@ class Lock:
             _LOGGER.debug("%s: No activity", self.name)
             return None
 
-        if activity_type == LockActivityType.DOOR.value:
+        if activity_type in (
+            LockActivityType.DOOR.value,
+            LockActivityType.DOOR_SENSE.value,
+        ):
             # Timestamp is at 0x05-0x08
             # Door status is at 0x09
+            # DOOR (0x20): standard door open/close/ajar event
+            # DOOR_SENSE (0x17): door sensor event; identical wire layout to DOOR
             timestamp = self._parse_unix_timestamp(response[0x05:0x09])
             door_status = self._parse_door_status(response[0x09])
             return DoorActivity(timestamp, door_status)
@@ -729,6 +734,16 @@ class Lock:
                 source=LockOperationSource.PIN,
                 slot=pin_slot,
             )
+        if activity_type == LockActivityType.UNKNOWN_40.value:
+            # Seen on fw 3.0.2 after lock operations; wire layout not yet determined
+            # (one sample: timestamp-like bytes at [5:9], status byte [9] = 0x00).
+            # Log the raw frame for future analysis and skip rather than warning.
+            _LOGGER.debug(
+                "%s: Activity type 0x40 (layout unconfirmed, skipping): %s",
+                self.name,
+                response.hex(),
+            )
+            return None
         _LOGGER.warning("%s: Unknown activity type: 0x%02X", self.name, activity_type)
         return None
 
