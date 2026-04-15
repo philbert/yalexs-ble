@@ -694,10 +694,19 @@ class Lock:
             # Lock status is at 0x06
             # Operation source is at 0x05
             # Remote type is at 0x07
+            # [0x0C] probable battery % (0–100); [0x0D] probable temperature °C
             timestamp = self._parse_unix_timestamp(response[0x08:0x0C])
             lock_status = self._parse_lock_status(response[0x06])
             operation_source, remote_type = self._parse_operation_source(
                 response[0x05], response[0x07]
+            )
+            _LOGGER.debug(
+                "%s: GET_LOG LOCK candidate_battery=%d%% candidate_temp=%d°C"
+                " unparsed=[%s]",
+                self.name,
+                response[0x0C],
+                response[0x0D],
+                response[0x0C:0x10].hex(),
             )
 
             return LockActivity(

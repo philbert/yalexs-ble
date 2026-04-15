@@ -140,8 +140,11 @@ VALUE_TO_LOCK_OPERATION_SOURCE = {
 
 
 class LockOperationRemoteType(Enum):
-    UNKNOWN = 0x00
-    BLE = 0x03
+    MULTI_DEVICE_BRIDGE = 0x00  # multiple-device bridge (hub/WiFi) — Yale app RemoteType ordinal 0
+    ONE_DEVICE_BRIDGE = 0x01    # single-device bridge (WiFi) — Yale app RemoteType ordinal 1
+    HUB = 0x02                  # Yale hub — Yale app RemoteType ordinal 2
+    BLE = 0x03                  # direct BLE (phone to lock)
+    UNKNOWN = 0xFF
 
 
 VALUE_TO_LOCK_OPERATION_REMOTE_TYPE = {
