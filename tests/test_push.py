@@ -201,6 +201,7 @@ async def test_update_continues_after_battery_timeout():
 
     # Battery times out
     mock_lock.battery = AsyncMock(side_effect=TimeoutError("Battery timeout"))
+    mock_lock.battery_level = AsyncMock(return_value=None)
 
     # But other calls succeed
     mock_lock.door_status = AsyncMock(return_value=DoorStatus.CLOSED)
@@ -328,6 +329,76 @@ async def test_poll_battery_success():
 
     # Cooldown should be reset to NEVER_TIME
     assert push_lock._next_battery_attempt_time == NEVER_TIME
+
+
+@pytest.mark.asyncio
+async def test_poll_battery_tries_bat_level_after_timeout():
+    """Test that _poll_battery probes 0x28 before entering timeout cooldown."""
+    push_lock = PushLock(
+        address="aa:bb:cc:dd:ee:ff",
+        key="0800200c9a66",
+        key_index=1,
+        always_connected=False,
+    )
+    push_lock._name = "Test Lock"
+
+    mock_lock = MagicMock()
+    battery_state = BatteryState(voltage=6.0, percentage=80)
+    mock_lock.battery = AsyncMock(side_effect=TimeoutError("0x0F timeout"))
+    mock_lock.battery_level = AsyncMock(return_value=battery_state)
+
+    initial_state = LockState(
+        lock=LockStatus.LOCKED,
+        door=DoorStatus.CLOSED,
+        battery=None,
+        auth=None,
+        auto_lock=None,
+        auto_lock_prev=None,
+    )
+
+    result_state, made_request = await push_lock._poll_battery(mock_lock, initial_state)
+
+    assert made_request is True
+    mock_lock.battery.assert_called_once()
+    mock_lock.battery_level.assert_called_once()
+    assert result_state.battery == battery_state
+    assert result_state.auth is not None
+    assert result_state.auth.successful is True
+    assert push_lock._next_battery_attempt_time == NEVER_TIME
+
+
+@pytest.mark.asyncio
+async def test_poll_battery_sets_cooldown_after_bat_level_probe_returns_none():
+    """Test that _poll_battery still cools down when 0x28 does not decode."""
+    push_lock = PushLock(
+        address="aa:bb:cc:dd:ee:ff",
+        key="0800200c9a66",
+        key_index=1,
+        always_connected=False,
+    )
+    push_lock._name = "Test Lock"
+
+    mock_lock = MagicMock()
+    mock_lock.battery = AsyncMock(side_effect=TimeoutError("0x0F timeout"))
+    mock_lock.battery_level = AsyncMock(return_value=None)
+
+    initial_state = LockState(
+        lock=LockStatus.LOCKED,
+        door=DoorStatus.CLOSED,
+        battery=None,
+        auth=None,
+        auto_lock=None,
+        auto_lock_prev=None,
+    )
+
+    before = time.monotonic()
+    result_state, made_request = await push_lock._poll_battery(mock_lock, initial_state)
+
+    assert made_request is True
+    mock_lock.battery.assert_called_once()
+    mock_lock.battery_level.assert_called_once()
+    assert result_state == initial_state
+    assert push_lock._next_battery_attempt_time >= before + 299
 
 
 @pytest.mark.asyncio
@@ -889,4 +960,3 @@ async def test_lock_operation_failure_preserves_known_state() -> None:
     assert health.state == "degraded"
     assert health.consecutive_failures == 1
     assert health.last_error == "BleakNotFoundError"
-

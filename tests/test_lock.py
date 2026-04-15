@@ -358,6 +358,20 @@ async def test_lock_info_reads_model_first() -> None:
     assert call_order[0] == MODEL_NUMBER_CHARACTERISTIC
 
 
+@pytest.mark.asyncio
+async def test_battery_level_returns_none_for_implausible_frame(lock: Lock) -> None:
+    """Test that BAT_LEVEL frames are logged but not parsed when format is unknown."""
+    lock.client = MagicMock(is_connected=True)
+    lock.session = MagicMock()
+    lock.secure_session = MagicMock()
+
+    response = bytes.fromhex("bb020028000000005000000000000000140000")
+    with patch.object(lock, "_execute_command", AsyncMock(return_value=response)):
+        battery_state = await lock.battery_level()
+
+    assert battery_state is None
+
+
 def test_parse_bb_response_lock_activity(lock: Lock) -> None:
     """Test parsing 0xBB responses with lock activity."""
 

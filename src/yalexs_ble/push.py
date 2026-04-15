@@ -1008,14 +1008,50 @@ class PushLock:
             self._next_battery_attempt_time = NEVER_TIME
         except TimeoutError as err:
             _LOGGER.info(
-                "%s: Battery request timed out (%s), will retry in %d "
-                "seconds. Continuing with other updates.",
+                "%s: Battery request 0x0F timed out (%s), probing 0x28 before cooldown.",
                 self.name,
                 err,
-                BATTERY_TIMEOUT_COOLDOWN,
             )
-            # Set cooldown to prevent repeated timeouts
-            self._next_battery_attempt_time = now + BATTERY_TIMEOUT_COOLDOWN
+            try:
+                battery_state = await lock.battery_level()
+            except TimeoutError as level_err:
+                _LOGGER.info(
+                    "%s: Battery request timed out (%s), 0x28 probe also timed out (%s); "
+                    "will retry in %d seconds. Continuing with other updates.",
+                    self.name,
+                    err,
+                    level_err,
+                    BATTERY_TIMEOUT_COOLDOWN,
+                )
+                self._next_battery_attempt_time = now + BATTERY_TIMEOUT_COOLDOWN
+            except (BleakError, BleakDBusError) as level_err:
+                _LOGGER.info(
+                    "%s: Battery request timed out (%s), 0x28 probe failed (%s); "
+                    "will retry in %d seconds. Continuing with other updates.",
+                    self.name,
+                    err,
+                    level_err,
+                    BATTERY_TIMEOUT_COOLDOWN,
+                )
+                self._next_battery_attempt_time = now + BATTERY_TIMEOUT_COOLDOWN
+            else:
+                if battery_state is None:
+                    _LOGGER.info(
+                        "%s: Battery request 0x0F timed out (%s), 0x28 probe returned "
+                        "an unparsed frame; will retry in %d seconds. Continuing with "
+                        "other updates.",
+                        self.name,
+                        err,
+                        BATTERY_TIMEOUT_COOLDOWN,
+                    )
+                    self._next_battery_attempt_time = now + BATTERY_TIMEOUT_COOLDOWN
+                else:
+                    _AUTH_FAILURE_HISTORY.auth_success(self.address)
+                    state = replace(
+                        state, battery=battery_state, auth=AuthState(successful=True)
+                    )
+                    self._next_battery_attempt_time = NEVER_TIME
+                    return state, True
         except (BleakError, BleakDBusError) as err:
             _LOGGER.debug(
                 "%s: Battery request failed (%s), continuing with other updates.",

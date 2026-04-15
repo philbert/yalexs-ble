@@ -478,10 +478,20 @@ class Lock:
     ) -> bytes:
         assert self.session is not None  # nosec
         command = self.session.build_operation_command(opcode, cmd_byte)
-        _LOGGER.debug("%s: send: [%s] [%s]", self.name, command.hex(), hex(cmd_byte))
+        _LOGGER.debug(
+            "%s: %s raw request: [%s] [%s]",
+            self.name,
+            command_name,
+            command.hex(),
+            hex(cmd_byte),
+        )
         response = await self.session.execute(command, command_name)
         _LOGGER.debug(
-            "%s: response: [%s] [%s]", self.name, response.hex(), hex(cmd_byte)
+            "%s: %s raw response: [%s] [%s]",
+            self.name,
+            command_name,
+            response.hex(),
+            hex(cmd_byte),
         )
         return response
 
@@ -555,6 +565,22 @@ class Lock:
         percentage = convert_voltage_to_percentage(voltage / 4)
         return BatteryState(voltage, percentage)
 
+    def _parse_battery_state_if_plausible(
+        self, response: bytes, status_type: StatusType
+    ) -> BatteryState | None:
+        """Parse a battery response only if it looks like a real voltage frame."""
+        battery_state = self._parse_battery_state(response)
+        if 3.0 < battery_state.voltage <= 8.0:
+            return battery_state
+        _LOGGER.info(
+            "%s: Battery response for %s is not a plausible voltage frame: %s -> %.3fV",
+            self.name,
+            status_type.name,
+            response.hex(),
+            battery_state.voltage,
+        )
+        return None
+
     @raise_if_not_connected
     async def battery(self) -> BatteryState:
         _LOGGER.debug("%s: Executing battery", self.name)
@@ -563,6 +589,16 @@ class Lock:
         )
         _LOGGER.debug("%s: Finished executing battery", self.name)
         return self._parse_battery_state(response)
+
+    @raise_if_not_connected
+    async def battery_level(self) -> BatteryState | None:
+        """Probe the BAT_LEVEL status used by the Yale app."""
+        _LOGGER.debug("%s: Executing battery_level", self.name)
+        response = await self._execute_command(
+            Commands.GETSTATUS, StatusType.BAT_LEVEL, "battery_level"
+        )
+        _LOGGER.debug("%s: Finished executing battery_level", self.name)
+        return self._parse_battery_state_if_plausible(response, StatusType.BAT_LEVEL)
 
     @raise_if_not_connected
     async def auto_lock_status(self) -> AutoLockState:

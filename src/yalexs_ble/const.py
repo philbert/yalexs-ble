@@ -45,6 +45,7 @@ class StatusType(IntEnum):
     DOOR_ONLY = 0x2E
     DOOR_AND_LOCK = 0x2F
     BATTERY = 0x0F
+    BAT_LEVEL = 0x28
 
 
 class SettingType(IntEnum):
