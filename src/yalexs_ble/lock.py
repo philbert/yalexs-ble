@@ -733,6 +733,22 @@ class Lock:
         return self._parse_lock_activity(response)
 
     @raise_if_not_connected
+    async def lock_events_unread(self) -> int:
+        """Query the number of unread log entries stored on the lock (LOCK_EVENTS_UNREAD = 0x09).
+
+        Returns the count at response byte [0x08]. Returns 0 if the response is
+        not a recognised 0xBB frame (e.g. lock does not support this status code).
+        """
+        _LOGGER.debug("%s: Executing lock_events_unread", self.name)
+        response = await self._execute_command(
+            Commands.GETSTATUS, StatusType.LOCK_EVENTS_UNREAD, "lock_events_unread"
+        )
+        _LOGGER.debug("%s: Finished executing lock_events_unread", self.name)
+        if response[0] != 0xBB:
+            return 0
+        return response[0x08]
+
+    @raise_if_not_connected
     async def lock_activity(self) -> DoorActivity | LockActivity | None:
         _LOGGER.debug("%s: Executing lock_activity", self.name)
         entry = await self._get_log_entry("lock_activity")

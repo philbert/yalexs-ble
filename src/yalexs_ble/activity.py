@@ -173,6 +173,35 @@ class ActivityManager:
         _LOGGER.debug("%s: Starting deferred activity update", self._lock.name)
 
         lock = await self._lock.ensure_connected()
+
+        # Pre-flight: query how many unread log entries the lock has.
+        # This tells us whether a GET_LOG round-trip is worth making and,
+        # critically, lets us observe the 0x09 response format on the wire.
+        # If the query fails (timeout, unsupported) we fall through and try
+        # GET_LOG directly so existing behaviour is preserved.
+        unread_count: int | None = None
+        try:
+            unread_count = await lock.lock_events_unread()
+            _LOGGER.debug(
+                "%s: LOCK_EVENTS_UNREAD (0x09): %d unread log entr%s on lock",
+                self._lock.name,
+                unread_count,
+                "y" if unread_count == 1 else "ies",
+            )
+            if unread_count == 0:
+                _LOGGER.debug(
+                    "%s: No activity found while polling after maximum of %s retries",
+                    self._lock.name,
+                    max_retries,
+                )
+                return
+        except Exception:  # noqa: BLE001
+            _LOGGER.debug(
+                "%s: LOCK_EVENTS_UNREAD query failed; falling back to direct GET_LOG",
+                self._lock.name,
+                exc_info=True,
+            )
+
         first_result = await lock.lock_activity()
 
         if not first_result:
