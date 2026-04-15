@@ -16,6 +16,7 @@ from .const import (
     LockInfo,
 )
 from .lock import Lock
+from .session import DisconnectedError
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -195,6 +196,11 @@ class ActivityManager:
                     max_retries,
                 )
                 return
+        except DisconnectedError:
+            # Lock dropped the connection (it doesn't support 0x09, or was
+            # already gone). There is no point trying GET_LOG on a dead
+            # connection — re-raise so push.py's reconnect machinery handles it.
+            raise
         except Exception:  # noqa: BLE001
             _LOGGER.debug(
                 "%s: LOCK_EVENTS_UNREAD query failed; falling back to direct GET_LOG",
