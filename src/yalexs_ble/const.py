@@ -103,7 +103,7 @@ class LockActivityType(Enum):
 
 @dataclass
 class BatteryState:
-    voltage: float
+    voltage: float | None  # None when only percentage is available (e.g. from GET_LOG)
     percentage: int
 
 
@@ -161,6 +161,7 @@ class LockActivity:
     source: LockOperationSource
     remote_type: LockOperationRemoteType | None = None
     slot: int | None = None
+    battery_pct: int | None = None  # Battery percentage from GET_LOG LOCK entry (byte[0x0C])
 
 
 @dataclass

@@ -938,7 +938,7 @@ class PushLock:
                 if lock_state.door != state:
                     changes["door"] = state
             elif isinstance(state, BatteryState):
-                if state.voltage <= 3.0:
+                if state.voltage is not None and state.voltage <= 3.0:
                     _LOGGER.debug(
                         "%s: Battery voltage is impossible: %s",
                         self.name,

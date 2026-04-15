@@ -250,7 +250,17 @@ class Lock:
         # Handle lock activity
         if command == Commands.LOCK_ACTIVITY.value:
             if parsed_activity := self._parse_lock_activity(state):
-                return None, [parsed_activity]
+                extra_states: list[LockStateValue] = []
+                if (
+                    isinstance(parsed_activity, LockActivity)
+                    and parsed_activity.battery_pct is not None
+                ):
+                    extra_states.append(
+                        BatteryState(
+                            voltage=None, percentage=parsed_activity.battery_pct
+                        )
+                    )
+                return extra_states if extra_states else None, [parsed_activity]
             return None, None
 
         # Handle status commands
@@ -705,11 +715,12 @@ class Lock:
             operation_source, remote_type = self._parse_operation_source(
                 response[0x05], response[0x07]
             )
+            raw_battery_pct = response[0x0C]
+            battery_pct = raw_battery_pct if 1 <= raw_battery_pct <= 100 else None
             _LOGGER.debug(
-                "%s: GET_LOG LOCK candidate_battery=%d%% candidate_temp=%d°C"
-                " unparsed=[%s]",
+                "%s: GET_LOG LOCK battery=%s%% temp=%d°C unparsed=[%s]",
                 self.name,
-                response[0x0C],
+                raw_battery_pct if battery_pct is None else battery_pct,
                 response[0x0D],
                 response[0x0C:0x10].hex(),
             )
@@ -719,6 +730,7 @@ class Lock:
                 lock_status,
                 source=operation_source,
                 remote_type=remote_type,
+                battery_pct=battery_pct,
             )
         if activity_type == LockActivityType.PIN.value:
             # Timestamp is at 0x05-0x08
