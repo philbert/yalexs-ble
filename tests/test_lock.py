@@ -398,7 +398,9 @@ async def test_get_log_entry_sends_raw_0x2d(lock: Lock) -> None:
         result = await lock.get_log_entry()
 
     assert result == activity
-    mock_execute.assert_awaited_once_with(Commands.LOCK_ACTIVITY.value, "get_log_entry")
+    mock_execute.assert_awaited_once_with(
+        Commands.LOCK_ACTIVITY.value, "get_log_entry"
+    )
     mock_parse.assert_called_once_with(response)
 
 
@@ -432,7 +434,9 @@ async def test_get_log_respects_max_entries(lock: Lock) -> None:
     lock.secure_session = MagicMock()
 
     entry = DoorActivity(datetime(2024, 1, 1, 12, 0), DoorStatus.CLOSED)
-    with patch.object(lock, "_get_log_entry", AsyncMock(return_value=entry)) as mock_get_log_entry:
+    with patch.object(
+        lock, "_get_log_entry", AsyncMock(return_value=entry)
+    ) as mock_get_log_entry:
         result = await lock.get_log(max_entries=2)
 
     assert result == [entry, entry]
