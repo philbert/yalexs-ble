@@ -133,10 +133,12 @@ class Session:
         if response[0x00] != 0xBB and response[0x00] != 0xAA:
             raise ResponseError(f"Incorrect flag in response: {response[0x00]}")
 
-    async def _write(self, command: bytearray, command_name: str) -> bytes:
+    async def _write(
+        self, command: bytearray, command_name: str, timeout: float = 10.0
+    ) -> bytes:
         """Write under the lock."""
         async with self._lock:
-            return await self._locked_write(command, command_name)
+            return await self._locked_write(command, command_name, timeout)
 
     def _notify(self, char: int, data: bytes) -> None:
         self._last_callback_time = time.monotonic()
@@ -164,7 +166,9 @@ class Session:
         self._notify_future.set_result(decrypted_data)
         self._notify_future = None
 
-    async def _locked_write(self, command: bytearray, command_name: str) -> bytes:
+    async def _locked_write(
+        self, command: bytearray, command_name: str, timeout: float = 10.0
+    ) -> bytes:
         # NOTE: The last two bytes are not encrypted
         # General idea seems to be that if the last byte
         # of the command indicates an offline key offset (is non-zero),
@@ -179,29 +183,35 @@ class Session:
             "%s: Encrypted command %s: %s", self.name, command_name, command.hex()
         )
 
-        for attempt in range(3):
-            future: asyncio.Future[bytes] = self.loop.create_future()
-            self._notify_future = future
-            _LOGGER.debug(
-                "%s: Writing command to %s: %s",
-                self.name,
-                self.write_characteristic,
-                command.hex(),
-            )
-            _LOGGER.debug("%s: Waiting for response", self.name)
-            async with util.asyncio_timeout(10):
-                try:
-                    await self.client.write_gatt_char(
-                        self.write_characteristic, command, True
-                    )
-                    result = await future
-                except ResponseError:
-                    if attempt == 2:
-                        raise
-                    _LOGGER.debug("%s: Invalid response, retrying", self.name)
-                    continue
-                else:
-                    break
+        try:
+            for attempt in range(3):
+                future: asyncio.Future[bytes] = self.loop.create_future()
+                self._notify_future = future
+                _LOGGER.debug(
+                    "%s: Writing command to %s: %s",
+                    self.name,
+                    self.write_characteristic,
+                    command.hex(),
+                )
+                _LOGGER.debug("%s: Waiting for response", self.name)
+                async with util.asyncio_timeout(timeout):
+                    try:
+                        await self.client.write_gatt_char(
+                            self.write_characteristic, command, True
+                        )
+                        result = await future
+                    except ResponseError:
+                        if attempt == 2:
+                            raise
+                        _LOGGER.debug("%s: Invalid response, retrying", self.name)
+                        continue
+                    else:
+                        break
+        except (TimeoutError, asyncio.CancelledError):
+            # Clean up stale future so any late-arriving notification is
+            # not directed at an abandoned/cancelled future.
+            self._notify_future = None
+            raise
         _LOGGER.debug("%s: Got response: %s", self.name, result.hex())
         return result
 
@@ -243,7 +253,12 @@ class Session:
         except BleakError as err:
             _LOGGER.debug("%s: Bleak error stopping notify: %s", self.name, err)
 
-    async def execute(self, command: bytearray, command_name: str) -> bytes:
+    async def execute(
+        self,
+        command: bytearray,
+        command_name: str,
+        timeout: float = 10.0,
+    ) -> bytes:
         """Execute command."""
         while (
             self._enable_cooldown
@@ -266,7 +281,7 @@ class Session:
             async with interrupt(
                 disconnected_future, DisconnectedError, f"{self.name}: Disconnected"
             ):
-                return await self._write(command, command_name)
+                return await self._write(command, command_name, timeout)
         except BleakError as err:
             if self._first_request and util.is_key_error(err):
                 raise AuthError(

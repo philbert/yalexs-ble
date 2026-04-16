@@ -49,6 +49,9 @@ from .session import AuthError, DisconnectedError, Session, YaleXSBLEError
 _LOGGER = logging.getLogger(__name__)
 
 LOCK_INFO_TIMEOUT = 3
+# Battery commands on some lock firmware never respond; use a short timeout so
+# startup probing does not block the BLE proxy slot for 10 s × 2 queries.
+BATTERY_PROBE_TIMEOUT = 3.0
 
 AA_BATTERY_VOLTAGE_TO_PERCENTAGE = (
     (1.55, 100),
@@ -484,7 +487,11 @@ class Lock:
             await self.force_unlock()
 
     async def _execute_command(
-        self, opcode: int, cmd_byte: int, command_name: str
+        self,
+        opcode: int,
+        cmd_byte: int,
+        command_name: str,
+        timeout: float = 10.0,
     ) -> bytes:
         assert self.session is not None  # nosec
         command = self.session.build_operation_command(opcode, cmd_byte)
@@ -495,7 +502,7 @@ class Lock:
             command.hex(),
             hex(cmd_byte),
         )
-        response = await self.session.execute(command, command_name)
+        response = await self.session.execute(command, command_name, timeout)
         _LOGGER.debug(
             "%s: %s raw response: [%s] [%s]",
             self.name,
@@ -615,7 +622,7 @@ class Lock:
     async def battery(self) -> BatteryState:
         _LOGGER.debug("%s: Executing battery", self.name)
         response = await self._execute_command(
-            Commands.GETSTATUS, StatusType.BATTERY, "battery"
+            Commands.GETSTATUS, StatusType.BATTERY, "battery", BATTERY_PROBE_TIMEOUT
         )
         _LOGGER.debug("%s: Finished executing battery", self.name)
         return self._parse_battery_state(response)
@@ -625,7 +632,10 @@ class Lock:
         """Probe the BAT_LEVEL status used by the Yale app."""
         _LOGGER.debug("%s: Executing battery_level", self.name)
         response = await self._execute_command(
-            Commands.GETSTATUS, StatusType.BAT_LEVEL, "battery_level"
+            Commands.GETSTATUS,
+            StatusType.BAT_LEVEL,
+            "battery_level",
+            BATTERY_PROBE_TIMEOUT,
         )
         _LOGGER.debug("%s: Finished executing battery_level", self.name)
         return self._parse_battery_state_if_plausible(response, StatusType.BAT_LEVEL)
