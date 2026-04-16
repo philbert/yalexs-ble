@@ -6,6 +6,8 @@ from collections.abc import Callable, Iterable
 from functools import partial
 from typing import Any, Protocol
 
+from bleak import BleakError
+
 from .const import (
     LOCK_ACTIVITY_POLL_RETRIES,
     LOCK_ACTIVITY_POLL_RETRY_EXPONENTIAL_BACKOFF_SECONDS,
@@ -173,31 +175,57 @@ class ActivityManager:
         _LOGGER.debug("%s: Starting deferred activity update", self._lock.name)
 
         lock = await self._lock.ensure_connected()
-        first_result = await lock.lock_activity()
 
-        if not first_result:
-            if retries < max_retries:
-                _LOGGER.debug(
-                    "%s: No activity found while polling on attempt %s; "
-                    "retrying up to %s more times",
-                    self._lock.name,
-                    retries,
-                    max_retries - retries,
-                )
-                self.schedule_activity_poll(
-                    backoff * (2**retries),
-                    retries=retries + 1,
-                    max_retries=max_retries,
-                    backoff=backoff,
-                )
-            else:
-                _LOGGER.debug(
-                    "%s: No activity found while polling after maximum of %s retries",
-                    self._lock.name,
-                    max_retries,
-                )
+        # Phase 1 capture-only flow: ask the lock how many unread log entries
+        # exist (LOCK_EVENTS_UNREAD = 0x09), then drain exactly that many via
+        # GET_LOG (0x2D). GET_LOG is destructive — each call consumes one entry —
+        # so we never poll speculatively. If the count query fails, retry with
+        # backoff so a transient BLE hiccup does not silently lose evidence.
+        try:
+            unread = await lock.lock_events_unread()
+        except (TimeoutError, BleakError) as err:
+            _LOGGER.debug(
+                "%s: lock_events_unread failed (%s)", self._lock.name, err
+            )
+            self._maybe_reschedule(retries, max_retries, backoff)
             return
 
-        # continue to fetch activity while some is available
-        while (await lock.lock_activity()) is not None:
-            pass
+        _LOGGER.debug(
+            "%s: Activity drain: %d unread entries on lock", self._lock.name, unread
+        )
+        if unread == 0:
+            return
+
+        for index in range(unread):
+            try:
+                raw = await lock.get_log_entry_raw()
+            except (TimeoutError, BleakError) as err:
+                _LOGGER.debug(
+                    "%s: GET_LOG failed at entry %d/%d (%s); aborting drain",
+                    self._lock.name,
+                    index,
+                    unread,
+                    err,
+                )
+                return
+            parsed = lock._parse_lock_activity(raw)
+            if parsed is not None:
+                self._callback_activity(parsed)
+
+    def _maybe_reschedule(
+        self, retries: int, max_retries: int, backoff: float
+    ) -> None:
+        """Reschedule the activity poll with exponential backoff."""
+        if retries >= max_retries:
+            _LOGGER.debug(
+                "%s: Activity poll giving up after %d retries",
+                self._lock.name,
+                max_retries,
+            )
+            return
+        self.schedule_activity_poll(
+            backoff * (2**retries),
+            retries=retries + 1,
+            max_retries=max_retries,
+            backoff=backoff,
+        )

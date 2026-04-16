@@ -670,12 +670,38 @@ class Lock:
     @raise_if_not_connected
     async def lock_activity(self) -> DoorActivity | LockActivity | None:
         _LOGGER.debug("%s: Executing lock_activity", self.name)
+        response = await self.get_log_entry_raw()
+        return self._parse_lock_activity(response)
+
+    @raise_if_not_connected
+    async def get_log_entry_raw(self) -> bytes:
+        """Issue GET_LOG (0x2D) and return the raw 18-byte response.
+
+        GET_LOG is a destructive read on the lock — each call consumes one entry
+        from the lock's activity log. Callers must size their drain via
+        `lock_events_unread()` first; do not call in an unbounded loop.
+        """
         assert self.session is not None  # nosec
         response = await self.session.execute(
-            self.session.build_command(Commands.LOCK_ACTIVITY.value), "lock_activity"
+            self.session.build_command(Commands.LOCK_ACTIVITY.value), "get_log_entry"
         )
-        _LOGGER.debug("%s: Finished executing lock_activity", self.name)
-        return self._parse_lock_activity(response)
+        _LOGGER.debug("%s: GET_LOG raw response: %s", self.name, response.hex())
+        return response
+
+    @raise_if_not_connected
+    async def lock_events_unread(self) -> int:
+        """Return the count of unread activity-log entries on the lock.
+
+        Wraps GETSTATUS LOCK_EVENTS_UNREAD (0x09). Used to size GET_LOG drains
+        without speculative polling.
+        """
+        _LOGGER.debug("%s: Executing lock_events_unread", self.name)
+        response = await self._execute_command(
+            Commands.GETSTATUS, StatusType.LOCK_EVENTS_UNREAD, "lock_events_unread"
+        )
+        count = response[0x08]
+        _LOGGER.debug("%s: lock_events_unread = %d", self.name, count)
+        return count
 
     async def disconnect(self) -> None:
         """Disconnect from the lock."""

@@ -42,6 +42,7 @@ class Commands(IntEnum):
 
 class StatusType(IntEnum):
     LOCK_ONLY = 0x02
+    LOCK_EVENTS_UNREAD = 0x09
     DOOR_ONLY = 0x2E
     DOOR_AND_LOCK = 0x2F
     BATTERY = 0x0F
