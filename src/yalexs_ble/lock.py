@@ -50,6 +50,14 @@ _LOGGER = logging.getLogger(__name__)
 
 LOCK_INFO_TIMEOUT = 3
 
+# Yale Durus carries pack voltage at bytes[0x0C..0x0D] of LOCK-activity (Format-B)
+# GET_LOG entries — little-endian uint16 millivolts. Other GET_LOG subtypes leave
+# this field zero, so we only parse it for activity_type == LOCK and bound it to a
+# plausible 4xAA series-pack range to reject zero-padding / unrelated bytes.
+LOCK_ACTIVITY_BATTERY_OFFSET = 0x0C
+MIN_PLAUSIBLE_BATTERY_MV = 4000
+MAX_PLAUSIBLE_BATTERY_MV = 8000
+
 AA_BATTERY_VOLTAGE_TO_PERCENTAGE = (
     (1.55, 100),
     (1.549, 97),
@@ -249,9 +257,15 @@ class Lock:
 
         # Handle lock activity
         if command == Commands.LOCK_ACTIVITY.value:
-            if parsed_activity := self._parse_lock_activity(state):
-                return None, [parsed_activity]
-            return None, None
+            parsed_activity = self._parse_lock_activity(state)
+            parsed_battery = self._parse_lock_activity_battery(state)
+            states: list[LockStateValue] | None = (
+                [parsed_battery] if parsed_battery else None
+            )
+            activities: list[LockActivityValue] | None = (
+                [parsed_activity] if parsed_activity else None
+            )
+            return states, activities
 
         # Handle status commands
         if command == Commands.GETSTATUS.value:
@@ -666,6 +680,39 @@ class Lock:
             )
         _LOGGER.warning("%s: Unknown activity type: 0x%02X", self.name, activity_type)
         return None
+
+    def _parse_lock_activity_battery(self, state: bytes) -> BatteryState | None:
+        """Extract battery state from a Format-B LOCK-activity GET_LOG entry.
+
+        On Yale Durus, LOCK-activity log entries (byte[4] == 0x00) carry the
+        full 4xAA pack voltage at bytes[0x0C..0x0D] as little-endian uint16
+        millivolts. Other GET_LOG subtypes leave this field zero. The Durus
+        firmware does not respond to GETSTATUS BATTERY (0x0F) or BAT_LEVEL
+        (0x28), so this is the only reliable battery source for that model.
+        """
+        if len(state) < LOCK_ACTIVITY_BATTERY_OFFSET + 2:
+            return None
+        if state[0x04] != LockActivityType.LOCK.value:
+            return None
+        raw_mv = int.from_bytes(
+            state[
+                LOCK_ACTIVITY_BATTERY_OFFSET : LOCK_ACTIVITY_BATTERY_OFFSET + 2
+            ],
+            "little",
+        )
+        if not MIN_PLAUSIBLE_BATTERY_MV <= raw_mv <= MAX_PLAUSIBLE_BATTERY_MV:
+            return None
+        voltage = raw_mv / 1000  # mV -> V (full pack voltage)
+        # 4xAA in series; reuse the per-cell AA discharge curve.
+        percentage = convert_voltage_to_percentage(voltage / 4)
+        _LOGGER.debug(
+            "%s: GET_LOG battery: %d mV -> %.3f V pack -> %d%%",
+            self.name,
+            raw_mv,
+            voltage,
+            percentage,
+        )
+        return BatteryState(voltage, percentage)
 
     @raise_if_not_connected
     async def lock_activity(self) -> DoorActivity | LockActivity | None:

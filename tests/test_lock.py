@@ -415,6 +415,71 @@ def test_parse_bb_response_lock_activity(lock: Lock) -> None:
         assert activity is None
 
 
+def test_parse_lock_activity_battery_durus(lock: Lock) -> None:
+    """Format-B GET_LOG entries on Durus carry pack mV at bytes[12..13] LE."""
+    # Real Durus capture (Garage front UNLOCK):
+    # bb 2d 00 ?? 00 00 05 01 ?? ?? ?? ?? 3f 19 00 00 02 00
+    # bytes[12..13] = 0x193f = 6463 mV
+    response = bytearray.fromhex("bb2d00000000050100000000" "3f19" "0000" "0200")
+    parsed = lock._parse_lock_activity_battery(response)
+    assert parsed is not None
+    assert parsed.voltage == pytest.approx(6.463)
+    assert parsed.percentage == 100  # tops out the AA per-cell curve
+
+
+def test_parse_lock_activity_battery_lower_voltage(lock: Lock) -> None:
+    """Lower-pack-voltage Durus capture (Garage side, MEDIUM bucket)."""
+    # bytes[12..13] = 0x14d6 = 5334 mV -> /4 = 1.3335 V/cell
+    response = bytearray.fromhex("bb2d00000000050100000000" "d614" "0000" "0200")
+    parsed = lock._parse_lock_activity_battery(response)
+    assert parsed is not None
+    assert parsed.voltage == pytest.approx(5.334)
+    # 1.3335 V/cell falls between 1.33 (35%) and 1.34 (40%) on the curve.
+    assert parsed.percentage == 35
+
+
+def test_parse_lock_activity_battery_skips_non_lock_subtype(lock: Lock) -> None:
+    """Format-A entries (byte[4] != 0x00) leave bytes[12..13] meaningless."""
+    response = bytearray.fromhex("bb2d000017000005010000003f190000" "0200")
+    # byte[4] = 0x17 (heartbeat-style subtype). Even with a plausible mV at
+    # bytes[12..13], we must not treat this as a battery reading.
+    assert lock._parse_lock_activity_battery(response) is None
+
+
+def test_parse_lock_activity_battery_rejects_zero_mv(lock: Lock) -> None:
+    """Bytes[12..13] = 0x0000 means no battery field present."""
+    response = bytearray(18)
+    response[0] = 0xBB
+    response[1] = Commands.LOCK_ACTIVITY.value
+    response[0x04] = 0x00  # LOCK activity
+    assert lock._parse_lock_activity_battery(response) is None
+
+
+def test_parse_lock_activity_battery_rejects_implausible_mv(lock: Lock) -> None:
+    """Outside 4000–8000 mV is almost certainly noise, not battery."""
+    response = bytearray(18)
+    response[0] = 0xBB
+    response[1] = Commands.LOCK_ACTIVITY.value
+    response[0x04] = 0x00
+    # 0x0001 = 1 mV — wildly implausible
+    response[0x0C] = 0x01
+    response[0x0D] = 0x00
+    assert lock._parse_lock_activity_battery(response) is None
+
+
+def test_parse_bb_response_lock_activity_emits_battery(lock: Lock) -> None:
+    """A LOCK GET_LOG entry with valid mV must surface a BatteryState too."""
+    response = bytearray.fromhex("bb2d00000000050100000000" "3f19" "0000" "0200")
+    state, activity = lock._parse_bb_response(response)
+    assert state is not None
+    states = list(state)
+    assert len(states) == 1
+    assert isinstance(states[0], BatteryState)
+    assert states[0].voltage == pytest.approx(6.463)
+    # The activity itself is parsed by the existing _parse_lock_activity path.
+    assert activity is not None
+
+
 def test_parse_bb_response_status_commands(lock: Lock) -> None:
     """Test parsing 0xBB responses with GETSTATUS command."""
 
