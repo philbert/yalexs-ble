@@ -1195,7 +1195,12 @@ class PushLock:
         # established in _ensure_connected). Best-effort: if the lock does not
         # support GET_LOG (0x2D) or disconnects while draining, we log and
         # continue — the state update above already succeeded.
-        if not self._get_log_drained_this_session:
+        #
+        # Skip on first connection (has_lock_info=False): the block above just
+        # set a short 2.1 s disconnect timer specifically to release the BLE
+        # slot quickly so other locks can connect. Draining here would hold
+        # the slot for extra round-trips and defeat that purpose.
+        if has_lock_info and not self._get_log_drained_this_session:
             self._get_log_drained_this_session = True
             try:
                 while (await lock.lock_activity()) is not None:
