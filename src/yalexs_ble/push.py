@@ -1059,6 +1059,10 @@ class PushLock:
         # Asking for battery first seems to be reduce the chance of the lock
         # getting into a bad state.
         state = self._get_current_state()
+        # Don't carry forward an impossible battery value from a prior session;
+        # it causes an infinite forced-disconnect/reconnect loop.
+        if state.battery and state.battery.voltage <= 3.0:
+            state = replace(state, battery=None)
         made_request = False
 
         needs_battery_workaround = self._lock_info.model in NO_BATTERY_SUPPORT_MODELS
