@@ -31,6 +31,7 @@ from .const import (
     AuthState,
     AutoLockMode,
     AutoLockState,
+    BatterySource,
     BatteryState,
     ConnectionHealth,
     ConnectionInfo,
@@ -310,6 +311,7 @@ class PushLock:
         idle_disconnect_delay: float = DISCONNECT_DELAY,
         always_connected: bool = False,
         idle_disconnect_delay_pending_update: float = DISCONNECT_DELAY_PENDING_UPDATE,
+        battery_retrieval_method: BatterySource | None = None,
     ) -> None:
         """Init the lock watcher."""
         if local_name is None and address is None:
@@ -356,6 +358,19 @@ class PushLock:
         self._always_connected = always_connected
         self._slow_params_set = False
         self._next_battery_attempt_time = NEVER_TIME  # Cooldown after battery timeout
+        # How we fetch battery for this lock:
+        #   GATT - live GETSTATUS BATTERY (0x0F) request/response
+        #   LOG  - parsed out of GET_LOG (0x2D) LOCK-activity entries
+        #   None - not yet determined
+        # Once confirmed, the integration persists this so we don't keep
+        # timing out on 0x0F on locks that don't support it.
+        self._battery_retrieval_method: BatterySource | None = (
+            battery_retrieval_method
+        )
+        # Session-local: a GATT battery call has timed out. Used together
+        # with a subsequent LOG-sourced BatteryState to promote the lock to
+        # LOG-only retrieval.
+        self._had_gatt_battery_timeout = False
         self._last_auth_success: datetime | None = None
         self._last_auth_failure: datetime | None = None
         self._last_presence_seen: datetime | None = None
@@ -400,6 +415,17 @@ class PushLock:
     def battery(self) -> BatteryState | None:
         """Return the current battery state."""
         return self._lock_state.battery if self._lock_state else None
+
+    @property
+    def battery_retrieval_method(self) -> BatterySource | None:
+        """Return the currently-used battery retrieval method for this lock.
+
+        `None` means the lock has not yet reported a battery level by any
+        method; the default polling behavior (probe GATT first) still applies.
+        Callers that want to persist this across restarts should pass the
+        saved value back via the `battery_retrieval_method` constructor arg.
+        """
+        return self._battery_retrieval_method
 
     @property
     def auth(self) -> AuthState | None:
@@ -943,6 +969,17 @@ class PushLock:
                         state.voltage,
                     )
                     continue
+                if (
+                    state.source == BatterySource.LOG
+                    and self._had_gatt_battery_timeout
+                    and self._battery_retrieval_method != BatterySource.LOG
+                ):
+                    _LOGGER.info(
+                        "%s: Disabling GATT battery probe — GATT timed out "
+                        "and a valid activity-log battery reading was seen",
+                        self.name,
+                    )
+                    self._battery_retrieval_method = BatterySource.LOG
                 if lock_state.battery != state:
                     changes["battery"] = state
             elif isinstance(state, AutoLockState):
@@ -1006,6 +1043,9 @@ class PushLock:
             )
             # Reset cooldown on success
             self._next_battery_attempt_time = NEVER_TIME
+            # Confirm GATT support the first time it works on this lock.
+            if self._battery_retrieval_method is None:
+                self._battery_retrieval_method = BatterySource.GATT
         except TimeoutError as err:
             _LOGGER.info(
                 "%s: Battery request timed out (%s), will retry in %d "
@@ -1016,6 +1056,7 @@ class PushLock:
             )
             # Set cooldown to prevent repeated timeouts
             self._next_battery_attempt_time = now + BATTERY_TIMEOUT_COOLDOWN
+            self._had_gatt_battery_timeout = True
         except (BleakError, BleakDBusError) as err:
             _LOGGER.debug(
                 "%s: Battery request failed (%s), continuing with other updates.",
@@ -1072,7 +1113,11 @@ class PushLock:
             needs_battery_workaround,
         )
 
-        if not needs_battery_workaround and BatteryState not in self._seen_this_session:
+        skip_gatt_battery = (
+            needs_battery_workaround
+            or self._battery_retrieval_method == BatterySource.LOG
+        )
+        if not skip_gatt_battery and BatteryState not in self._seen_this_session:
             state, battery_requested = await self._poll_battery(lock, state)
             if battery_requested:
                 made_request = True
