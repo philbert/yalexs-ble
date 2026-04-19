@@ -2,6 +2,8 @@ from bleak_retry_connector import close_stale_connections_by_address
 
 from .const import (
     AutoLockMode,
+    BatterySource,
+    BatteryState,
     ConnectionHealth,
     ConnectionInfo,
     DoorActivity,
@@ -29,6 +31,8 @@ __version__ = "3.3.1"
 __all__ = [
     "AuthError",
     "AutoLockMode",
+    "BatterySource",
+    "BatteryState",
     "ConnectionHealth",
     "ConnectionInfo",
     "DisconnectedError",

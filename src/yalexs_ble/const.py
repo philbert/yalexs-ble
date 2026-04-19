@@ -98,10 +98,21 @@ class LockActivityType(Enum):
     NONE = 0x80
 
 
+class BatterySource(Enum):
+    """Where a BatteryState reading was derived from."""
+
+    # GETSTATUS BATTERY (0x0F) — live GATT request/response.
+    GATT = "gatt"
+    # GET_LOG Format-B LOCK-activity entry (0x2D) — only arrives when the
+    # lock logs an event (lock/unlock, etc.), not on demand.
+    LOG = "log"
+
+
 @dataclass
 class BatteryState:
     voltage: float
     percentage: int
+    source: BatterySource = BatterySource.GATT
 
 
 @dataclass

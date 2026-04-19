@@ -28,6 +28,7 @@ from .const import (
     VALUE_TO_LOCK_STATUS,
     AutoLockMode,
     AutoLockState,
+    BatterySource,
     BatteryState,
     Commands,
     DoorActivity,
@@ -567,7 +568,7 @@ class Lock:
         # currently have a way to detect the battery type,
         # this is the best we can do for now.
         percentage = convert_voltage_to_percentage(voltage / 4)
-        return BatteryState(voltage, percentage)
+        return BatteryState(voltage, percentage, BatterySource.GATT)
 
     @raise_if_not_connected
     async def battery(self) -> BatteryState:
@@ -712,7 +713,7 @@ class Lock:
             voltage,
             percentage,
         )
-        return BatteryState(voltage, percentage)
+        return BatteryState(voltage, percentage, BatterySource.LOG)
 
     @raise_if_not_connected
     async def lock_activity(self) -> DoorActivity | LockActivity | None:
