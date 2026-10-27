@@ -17,6 +17,7 @@ from yalexs_ble.const import (
     AuthState,
     AutoLockMode,
     AutoLockState,
+    BatterySource,
     BatteryState,
     DoorActivity,
     DoorStatus,
@@ -44,7 +45,7 @@ from yalexs_ble.push import (
     DEFAULT_ATTEMPTS,
     HAP_FIRST_BYTE,
     NEVER_TIME,
-    NO_BATTERY_SUPPORT_MODELS,
+    NO_GATT_BATTERY_SUPPORT_MODELS,
     RECONNECT_BACKOFF_TIME,
     SLOW_LATENCY,
     SLOW_MAX_INTERVAL,
@@ -60,15 +61,20 @@ from yalexs_ble.session import (
     DisconnectedError,
     KeycodeError,
     ResponseError,
+    Session,
 )
+from yalexs_ble.util import _simple_checksum
 
 # Shared battery-supporting lock used across tests. model is NOT in
-# NO_BATTERY_SUPPORT_MODELS, so the battery-workaround path is not taken.
+# NO_GATT_BATTERY_SUPPORT_MODELS, so the battery-workaround path is not taken.
 TEST_LOCK_INFO = LockInfo(
     manufacturer="August",
     model="ASL-03",
     serial="12345",
     firmware="2.0.0",
+)
+DURUS_LOCK_INFO = LockInfo(
+    "Yale", "MD-04I", "12345", "3.4+I-8.0", device_name="Yale Durus"
 )
 
 
@@ -213,12 +219,12 @@ async def test_retry_bluetooth_connection_error_with_operation_lock():
     assert all(len(set(block)) == 1 for block in blocks)
 
 
-def test_needs_battery_workaround():
-    assert "SL-103" in NO_BATTERY_SUPPORT_MODELS
-    assert "CERES" in NO_BATTERY_SUPPORT_MODELS
-    assert "Yale Linus L2" in NO_BATTERY_SUPPORT_MODELS
-    assert "ASL-03" not in NO_BATTERY_SUPPORT_MODELS
-    assert "MD-04I" not in NO_BATTERY_SUPPORT_MODELS
+def test_models_without_gatt_battery_support():
+    assert "SL-103" in NO_GATT_BATTERY_SUPPORT_MODELS
+    assert "CERES" in NO_GATT_BATTERY_SUPPORT_MODELS
+    assert "Yale Linus L2" in NO_GATT_BATTERY_SUPPORT_MODELS
+    assert "ASL-03" not in NO_GATT_BATTERY_SUPPORT_MODELS
+    assert "MD-04I" not in NO_GATT_BATTERY_SUPPORT_MODELS
 
 
 @pytest.mark.asyncio
@@ -3042,7 +3048,11 @@ async def test_push_lock_keycode_requires_running() -> None:
 
 
 def _activity_push_lock(
-    drains: list[list[Any]], *, primed: bool = False
+    drains: list[list[Any]],
+    *,
+    primed: bool = False,
+    lock_info: LockInfo = TEST_LOCK_INFO,
+    subscribed: bool = True,
 ) -> tuple[PushLock, MagicMock, list[LockActivity | DoorActivity]]:
     """A PushLock whose only read in _update is the activity drain.
 
@@ -3054,8 +3064,9 @@ def _activity_push_lock(
     push_lock = _named_push_lock("aa:bb:cc:dd:ee:ff", always_connected=False)
     received: list[LockActivity | DoorActivity] = []
     # Registered before the lock is up, so no priming update is armed here.
-    push_lock.register_activity_callback(received.append)
-    push_lock._lock_info = TEST_LOCK_INFO
+    if subscribed:
+        push_lock.register_activity_callback(received.append)
+    push_lock._lock_info = lock_info
     push_lock._running = True
     push_lock._advertisement_data = _advertisement({})
     push_lock._seen_this_session.update(
@@ -3246,13 +3257,22 @@ _OVERRUN = ActivityLogOverrunError("log did not end")
     ],
     ids=["timeout", "overrun-empty", "overrun-without-end"],
 )
+@pytest.mark.parametrize(
+    ("lock_info", "subscribed"), [(TEST_LOCK_INFO, True), (DURUS_LOCK_INFO, False)]
+)
 async def test_activity_drain_backs_off_after_repeated_failures(
-    failed_drain: list[Any], strikes: int, caplog: pytest.LogCaptureFixture
+    failed_drain: list[Any],
+    strikes: int,
+    caplog: pytest.LogCaptureFixture,
+    lock_info: LockInfo,
+    subscribed: bool,
 ) -> None:
     """Enough failed drains warn once and pause; an empty overrun counts fully."""
     activity = _unlock(205)
     push_lock, mock_lock, received = _activity_push_lock(
-        [*([failed_drain] * strikes), [activity]]
+        [*([failed_drain] * strikes), [activity]],
+        lock_info=lock_info,
+        subscribed=subscribed,
     )
     drain = mock_lock.drain_lock_activity
     with caplog.at_level(logging.DEBUG, logger="yalexs_ble.push"):
@@ -3287,9 +3307,17 @@ async def test_registering_after_the_first_update_arms_the_priming_update() -> N
 
 
 @pytest.mark.asyncio
-async def test_operation_before_priming_reschedules_the_priming_update() -> None:
+@pytest.mark.parametrize(
+    ("lock_info", "subscribed"), [(TEST_LOCK_INFO, True), (DURUS_LOCK_INFO, False)]
+)
+async def test_operation_before_priming_reschedules_the_priming_update(
+    lock_info: LockInfo,
+    subscribed: bool,
+) -> None:
     """An operation cancels pending updates, so it re-arms the priming one."""
-    push_lock, _, _ = _activity_push_lock([])
+    push_lock, _, _ = _activity_push_lock(
+        [], lock_info=lock_info, subscribed=subscribed
+    )
     with patch.object(push_lock, "_schedule_future_update_with_debounce") as schedule:
         push_lock._complete_operation(time.monotonic())
     schedule.assert_called_once_with(ACTIVITY_PRIME_DELAY)
@@ -3389,3 +3417,196 @@ async def test_activity_priming_failure_retries_priming() -> None:
     await _run_update(push_lock, mock_lock)
     assert received == []
     assert push_lock._activity_primed is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("model", "device_name", "activity_battery", "gatt_battery"),
+    [
+        ("MD-04I", "Yale Durus", True, False),
+        ("MD-04I-EU", "Yale Durus", True, False),
+        ("MD-04I X", "Yale Durus", True, False),
+        ("MD-04I", None, False, True),
+        ("MD-04I", "Other lock", False, True),
+        ("MD-04I", "Yale Linus L2", False, True),
+        ("MD-04I", "Yale Durus Plus", False, True),
+        ("ASL-03", None, False, True),
+        ("", None, False, True),
+        ("SL-103", "Yale Linus L2", False, False),
+        ("CERES", None, False, False),
+        ("Yale Linus L2", None, False, False),
+        ("SL-103", "Yale Durus", True, False),
+        ("CERES", "Yale Durus", True, False),
+        ("Yale Linus L2", "Yale Durus", True, False),
+    ],
+)
+async def test_battery_source_selection_does_not_conflict(
+    model: str,
+    device_name: str | None,
+    activity_battery: bool,
+    gatt_battery: bool,
+) -> None:
+    """Activity support wins over model exclusions without issuing a GATT read."""
+    info = LockInfo("Yale", model, "x", "1.0", device_name=device_name)
+    push_lock, lock, _ = _activity_push_lock([[]], lock_info=info, subscribed=False)
+    push_lock._seen_this_session.discard(BatteryState)
+    lock.battery = publishing_read(push_lock, BatteryState(6.0, 80))
+
+    assert info.battery_from_activity is activity_battery
+    assert await push_lock._poll_battery(lock) is gatt_battery
+    assert lock.battery.await_count == int(gatt_battery)
+    assert await push_lock._poll_activity(lock, first_update=False) is activity_battery
+    assert lock.drain_lock_activity.call_count == int(activity_battery)
+
+
+@pytest.mark.asyncio
+async def test_durus_without_subscribers_defers_its_first_drain() -> None:
+    push_lock, lock, _ = _activity_push_lock(
+        [[]],
+        lock_info=DURUS_LOCK_INFO,
+        subscribed=False,
+    )
+    push_lock._lock_info = None
+    with (
+        patch.object(
+            push_lock, "_probe_lock_info", AsyncMock(return_value=DURUS_LOCK_INFO)
+        ),
+        patch.object(push_lock, "_schedule_future_update_with_debounce") as schedule,
+    ):
+        await _run_update(push_lock, lock)
+    schedule.assert_called_once_with(ACTIVITY_PRIME_DELAY)
+    lock.drain_lock_activity.assert_not_called()
+    await _run_update(push_lock, lock)
+    assert lock.drain_lock_activity.call_count == 1
+    assert push_lock._activity_primed is True
+    assert push_lock.battery is None
+    await _run_update(push_lock, lock)
+    assert lock.drain_lock_activity.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_durus_without_subscribers_drains_after_changes_and_refresh() -> None:
+    push_lock, lock, _ = _activity_push_lock(
+        [[], [], [], []],
+        lock_info=DURUS_LOCK_INFO,
+        subscribed=False,
+    )
+    await _run_update(push_lock, lock)
+    push_lock._update_any_state([LockStatus.LOCKED])
+    await _run_update(push_lock, lock)
+    push_lock._update_any_state([DoorStatus.OPENED])
+    await _run_update(push_lock, lock)
+    assert lock.drain_lock_activity.call_count == 3
+    await _run_update(push_lock, lock)
+    assert lock.drain_lock_activity.call_count == 3
+    push_lock._next_battery_refresh_time = NEVER_TIME
+    await _run_update(push_lock, lock)
+    assert lock.drain_lock_activity.call_count == 4
+    await _run_update(push_lock, lock)
+    assert lock.drain_lock_activity.call_count == 4
+
+
+@pytest.mark.asyncio
+async def test_durus_keeps_draining_after_the_last_subscriber_unregisters() -> None:
+    """Removing activity listeners must not stop the battery refresh."""
+    push_lock, lock, received = _activity_push_lock(
+        [[], [_unlock(1)]],
+        lock_info=DURUS_LOCK_INFO,
+        subscribed=False,
+    )
+    unregister = push_lock.register_activity_callback(received.append)
+    try:
+        await _run_update(push_lock, lock)
+        unregister()
+        push_lock._update_any_state([LockStatus.LOCKED])
+        await _run_update(push_lock, lock)
+        assert lock.drain_lock_activity.call_count == 2
+        assert received == []
+    finally:
+        push_lock._cancel_future_update()
+
+
+@pytest.mark.asyncio
+async def test_durus_reconnect_refreshes_even_with_the_same_lock_status() -> None:
+    push_lock, _, _ = _activity_push_lock(
+        [],
+        lock_info=DURUS_LOCK_INFO,
+        subscribed=False,
+        primed=True,
+    )
+    push_lock._activity_drain_pending = False
+    push_lock._next_battery_refresh_time = time.monotonic() + BATTERY_REFRESH_INTERVAL
+    assert push_lock._activity_drain_due() is False
+    lock = MagicMock(is_connected=True)
+    lock.connect = AsyncMock()
+    with patch.object(push_lock, "_get_lock_instance", return_value=lock):
+        await push_lock._ensure_connected()
+    try:
+        assert push_lock._activity_drain_due() is True
+        push_lock._earliest_activity_drain_time = time.monotonic() + 3600
+        assert push_lock._activity_drain_due() is False
+    finally:
+        push_lock._cancel_disconnect_timer()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error", [None, TimeoutError("drain interrupted")])
+@pytest.mark.parametrize("subscribed", [False, True])
+async def test_durus_battery_arrives_during_priming_through_a_real_session(
+    error: Exception | None,
+    subscribed: bool,
+) -> None:
+    push_lock, _, activities = _activity_push_lock(
+        [],
+        lock_info=DURUS_LOCK_INFO,
+        subscribed=subscribed,
+    )
+    published: list[BatteryState | None] = []
+    push_lock.register_callback(
+        lambda state, info, conn: published.append(state.battery)
+    )
+    lock = Lock(
+        lambda: BLEDevice(push_lock.address, "lock"),
+        "0800200c9a66",
+        1,
+        "Test Lock",
+        push_lock._state_callback,
+        DURUS_LOCK_INFO,
+    )
+    client = MagicMock(is_connected=True)
+    session = Session(
+        client, "Test Lock", asyncio.Lock(), set(), lock._internal_state_callback
+    )
+    session.decrypt = bytes  # type: ignore[method-assign, assignment]
+    session.cipher_encrypt = MagicMock(update=bytes)
+    lock.client = client
+    lock.session = session
+    lock.secure_session = MagicMock()
+    first = bytes.fromhex("bb2d0056000b0500a0a176a3df14194a0200")
+    second = bytearray(first)
+    second[0x0C:0x0E] = (6000).to_bytes(2, "little")
+    second[3] = 0
+    second[3] = _simple_checksum(second)
+    end = bytes.fromhex("bb2d00de800200009aa176a3a8a176a30200")
+    frames = iter([first, bytes(second), error or end])
+
+    async def deliver(*_args: Any, **_kwargs: Any) -> None:
+        frame = next(frames)
+        if isinstance(frame, Exception):
+            raise frame
+        session._notify(0, bytearray(frame))
+
+    client.write_gatt_char = AsyncMock(side_effect=deliver)
+    try:
+        assert await push_lock._poll_activity(lock, first_update=False) is True
+        assert published == [
+            BatteryState(5.343, 35, BatterySource.LOG),
+            BatteryState(6.0, 93, BatterySource.LOG),
+        ]
+        assert push_lock.battery == published[-1]
+        assert activities == []
+        assert client.write_gatt_char.await_count == 3
+        assert push_lock._activity_drain_pending is (error is not None)
+        assert push_lock._activity_primed is (error is None)
+    finally:
+        push_lock._cancel_disconnect_timer()
