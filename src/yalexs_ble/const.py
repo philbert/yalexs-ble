@@ -23,12 +23,17 @@ HAP_ENCRYPTED_FIRST_BYTE = 0x11
 RESPONSE_FRAME_LEN = 0x12
 
 
+DEVICE_NAME_CHARACTERISTIC = "00002a00-0000-1000-8000-00805f9b34fb"
 MANUFACTURER_NAME_CHARACTERISTIC = "00002a29-0000-1000-8000-00805f9b34fb"
 MODEL_NUMBER_CHARACTERISTIC = "00002a24-0000-1000-8000-00805f9b34fb"
 SERIAL_NUMBER_CHARACTERISTIC = "00002a25-0000-1000-8000-00805f9b34fb"
 FIRMWARE_REVISION_CHARACTERISTIC = "00002a26-0000-1000-8000-00805f9b34fb"
 
 NO_DOOR_SENSE_MODELS = {"ASL-02", "ASL-01"}
+
+# GATT models can identify Bluetooth modules shared by different lock products.
+# Use verified device names for this activity format and battery discharge curve.
+ACTIVITY_BATTERY_DEVICE_NAMES = {"Yale Durus"}
 
 
 # Slot reported for unlocks with the keypad master (programming) code, which
@@ -164,10 +169,16 @@ class LockActivityType(Enum):
     NONE = 0x80
 
 
+class BatterySource(Enum):
+    GATT = "gatt"
+    LOG = "log"
+
+
 @dataclass
 class BatteryState:
     voltage: float
     percentage: int
+    source: BatterySource = BatterySource.GATT
 
 
 @dataclass
@@ -240,6 +251,12 @@ class LockInfo:
     model: str
     serial: str
     firmware: str
+    device_name: str | None = None
+
+    @property
+    def battery_from_activity(self) -> bool:
+        """Check if battery voltage is carried in the activity log."""
+        return self.device_name in ACTIVITY_BATTERY_DEVICE_NAMES
 
     @property
     def door_sense(self) -> bool:

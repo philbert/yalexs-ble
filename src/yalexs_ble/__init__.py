@@ -3,6 +3,7 @@ from bleak_retry_connector import close_stale_connections_by_address
 from .const import (
     KEYPAD_MASTER_CODE_SLOT,
     AutoLockMode,
+    BatterySource,
     ConnectionInfo,
     DoorActivity,
     DoorStatus,
@@ -37,6 +38,7 @@ __all__ = [
     "KEYPAD_MASTER_CODE_SLOT",
     "AuthError",
     "AutoLockMode",
+    "BatterySource",
     "ConnectionInfo",
     "DisconnectedError",
     "DoorActivity",
